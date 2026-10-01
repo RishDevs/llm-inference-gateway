@@ -36,3 +36,7 @@ Setup instructions will be added once the first runnable version lands. The plan
 4. Admission control and metrics
 5. Paged KV cache, preemption, chunked prefill
 6. vLLM comparison and benchmark report
+
+## License
+
+[MIT](LICENSE)
