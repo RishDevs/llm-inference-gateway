@@ -13,3 +13,5 @@ results/
 *.log
 profile/
 *.pt
+results-run.log
+results-naive.log

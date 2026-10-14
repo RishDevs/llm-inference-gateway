@@ -12,6 +12,7 @@ PRESETS = {
         "admission": False,
         "max_wait_ms": 0.0,
         "join_wait_ms": 0.0,
+        "queue_timeout_s": 0.0,
     },
     "unguarded": {
         "admission": False,
