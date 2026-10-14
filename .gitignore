@@ -11,3 +11,5 @@ dist/
 .env
 results/
 *.log
+profile/
+*.pt

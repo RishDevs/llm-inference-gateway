@@ -1,41 +1,85 @@
 # LLM Inference Gateway
 
-A scheduling layer that sits in front of a large language model and serves many users at once on a single GPU. It uses continuous batching, token streaming and memory-aware admission control.
-
-> **Status:** early development. The design is documented in [docs/PROJECT.md](docs/PROJECT.md). The code is being built in phases.
-
-## Why
-
-Serving an LLM one request at a time leaves the GPU mostly idle and makes users wait in long queues. This project builds the serving engine that keeps the GPU busy and keeps users from waiting in line.
+A serving layer that sits in front of Qwen2.5-1.5B and serves many users at once on a single free T4 GPU. It groups requests into micro-batches, streams tokens as they're generated, and limits how much work reaches the GPU so traffic bursts don't crash it.
 
 ## What it does
 
-- **Continuous batching:** groups active requests into one GPU forward pass per step. Requests join and leave the batch at token boundaries.
-- **Token streaming:** sends tokens to clients as they are generated, over Server-Sent Events (OpenAI-compatible `/v1/completions`).
-- **Admission control:** limits how much work enters the GPU at once, based on free KV-cache memory and queue length, so traffic bursts can't cause out-of-memory crashes.
-- **Benchmarking:** load-tests the gateway against a naive one-request-at-a-time server and against [vLLM](https://github.com/vllm-project/vllm), with the same model, workload and client.
+- **Dynamic micro-batching:** new requests are prefilled together as a micro-batch and merged into the running batch at the next decode step. Finished requests leave right away, so nobody waits for someone else's long answer.
+- **Length-bucketed batching:** the running set can split into length lanes so short sequences don't carry the padding of long ones. A cost model calibrated on the GPU at startup decides when a split pays for its extra forward pass.
+- **Token streaming:** OpenAI-compatible `/v1/completions` with Server-Sent Events.
+- **Token-budget admission control and backpressure:** every batch reserves its padded KV-cache footprint against a budget sized from free GPU memory. Prefill size is capped. When the queue is full, the server returns `429` with `Retry-After`.
+- **Benchmarks:** closed-loop and burst load tests against a request-at-a-time baseline and against vLLM on the same GPU, plus a PyTorch Profiler run that measures padding waste.
 
-## How it's built
+## Architecture
 
-- The engine is written in this project: the scheduler, the KV-cache manager and the model forward pass (PyTorch). Model weights load from Hugging Face.
-- The API is FastAPI + uvicorn. A dedicated engine thread owns the GPU.
-- Metrics are exported in Prometheus format at `/metrics`.
-- Everything runs at zero cost: open-source libraries, open-weight models (Qwen2.5 / TinyLlama), and the free Google Colab T4 GPU.
+```
+client ──HTTP/SSE──▶ FastAPI (asyncio) ──submit──▶ waiting queue
+                         ▲                              │  admission: queue cap, token budget, prefill cap
+                         │ tokens                       ▼
+                 per-request asyncio.Queue ◀── engine thread: prefill micro-batch → merge into lane
+                                                       → decode each lane → evict finished → rebalance lanes
+                                                       │
+                                               Qwen2.5-1.5B, fp16, PyTorch SDPA
+```
 
-See [docs/PROJECT.md](docs/PROJECT.md) for the architecture, component details, benchmark methodology and open design decisions.
+Details are in [docs/PROJECT.md](docs/PROJECT.md).
 
-## Getting started
+## Quick start
 
-Setup instructions will be added once the first runnable version lands. The planned workflow (CPU unit tests locally, GPU benchmarks on Colab) is in [docs/PROJECT.md §9](docs/PROJECT.md#9-setup-and-running-for-free).
+### Local (CPU or Apple Silicon)
 
-## Roadmap
+```bash
+git clone https://github.com/RishDevs/llm-inference-gateway.git
+cd llm-inference-gateway
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+pytest -q
+python -m gateway.server --model Qwen/Qwen2.5-0.5B-Instruct
+```
 
-1. Naive baseline server + load generator
-2. Custom model forward pass, verified against Hugging Face
-3. Engine loop with continuous batching and SSE streaming
-4. Admission control and metrics
-5. Paged KV cache, preemption, chunked prefill
-6. vLLM comparison and benchmark report
+```bash
+curl -N localhost:8000/v1/completions -H 'Content-Type: application/json' -d '{"prompt":"The capital of France is","max_tokens":32,"temperature":0,"stream":true}'
+```
+
+### Google Colab (free T4)
+
+Open [`notebooks/colab_benchmark.ipynb`](notebooks/colab_benchmark.ipynb) in Colab, choose a T4 runtime, and run all cells. It runs every benchmark and the vLLM comparison, and writes `results/summary.md`.
+
+### Docker (any machine with an NVIDIA GPU)
+
+```bash
+docker compose up --build
+```
+
+## Server presets
+
+| Preset | What it is |
+|---|---|
+| `gateway` | Micro-batching + length lanes + admission control (default) |
+| `unbucketed` | Same, but one running batch with no length lanes |
+| `naive` | One request at a time: batch size 1, no admission control |
+| `unguarded` | Large batches with admission control off, used in the burst test |
+
+```bash
+python -m gateway.server --preset naive
+```
+
+Every setting can also be passed as a flag (`--max-batch-size 16`) or an environment variable (`GATEWAY_MAX_BATCH_SIZE=16`).
+
+## Benchmarks
+
+```bash
+bash scripts/run_benchmarks.sh
+```
+
+This runs the steady-state sweep (1/8/16/32 users) for `naive`, `unbucketed` and `gateway`, then the 32→64 user burst test, then the profiler. It writes JSON, plots and `results/summary.md`.
+
+## Docs
+
+- [docs/PROJECT.md](docs/PROJECT.md): design and setup
+- [docs/SIGNIFICANCE.md](docs/SIGNIFICANCE.md): what the project is and why it matters
+- [docs/WALKTHROUGH.md](docs/WALKTHROUGH.md): code walkthrough, file by file
+- [docs/DEFENSE.md](docs/DEFENSE.md): talking points, design decisions, Q&A
 
 ## License
 

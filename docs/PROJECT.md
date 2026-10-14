@@ -1,214 +1,176 @@
-# LLM Inference Gateway — Project Documentation
+# LLM Inference Gateway: Project Documentation
 
-**Status:** Design stage. No code exists yet. This document describes what the project will build, how it will be built, and how to run it at zero cost. Sections marked **Open decision** list the free options and their tradeoffs. Nothing in them has been chosen yet.
+**Status:** implemented. Every component below exists in the repo and is covered by tests. Benchmark numbers are produced by running `scripts/run_benchmarks.sh` on a GPU; this document doesn't quote results.
 
 ---
 
 ## Contents
 
 1. [What this project is](#1-what-this-project-is)
-2. [Goals and how they are measured](#2-goals-and-how-they-are-measured)
+2. [What it measures](#2-what-it-measures)
 3. [Architecture](#3-architecture)
 4. [Components](#4-components)
-5. [Baselines](#5-baselines)
+5. [Server presets and baselines](#5-server-presets-and-baselines)
 6. [Benchmark methodology](#6-benchmark-methodology)
 7. [Tech stack and cost](#7-tech-stack-and-cost)
-8. [Repository layout (planned)](#8-repository-layout-planned)
-9. [Setup and running for free](#9-setup-and-running-for-free)
-10. [Configuration (planned)](#10-configuration-planned)
-11. [Open decisions](#11-open-decisions)
-12. [Known constraints and risks](#12-known-constraints-and-risks)
-13. [Build order](#13-build-order)
+8. [Repository layout](#8-repository-layout)
+9. [Setup and running](#9-setup-and-running)
+10. [Configuration reference](#10-configuration-reference)
+11. [Design decisions](#11-design-decisions)
+12. [Known constraints](#12-known-constraints)
 
 ---
 
 ## 1. What this project is
 
-The gateway is a serving layer that sits between users and a large language model running on a single GPU.
+A serving layer for one LLM on one GPU. It accepts OpenAI-style completion requests over HTTP and schedules them onto the model in batches. It streams tokens back over Server-Sent Events and refuses work it can't fit in memory.
 
-**The problem.** If a server handles one request at a time, the GPU sits mostly idle. Generating one token for one user reads all the model weights from GPU memory but does very little arithmetic with them. Meanwhile every other user waits in line, so latency grows with queue length.
-
-**What the gateway does:**
-
-| Function | Description |
+| Function | How |
 |---|---|
-| Continuous batching | Groups active requests into one GPU forward pass per step. Requests join and leave the batch at token boundaries instead of waiting for a whole batch to finish. |
-| Token streaming | Sends each token to its client as soon as it is generated, using Server-Sent Events (SSE). |
-| Admission control | Limits how much work is on the GPU at once, based on free KV-cache memory and queue length. Excess requests wait or get rejected with HTTP 429, so bursts can't trigger out-of-memory (OOM) crashes. |
-| Benchmarking | Load-tests the gateway against a naive one-at-a-time server and against vLLM, using the same workload and the same client. |
+| Dynamic micro-batching | Waiting requests are prefilled together as a micro-batch, then merged into a running batch at the next step boundary. Finished requests are evicted from the batch right away. |
+| Length-bucketed batching | The running set can be split into up to `max_lanes` lanes by context length, so short sequences don't carry the padding of long ones. A cost model calibrated at startup decides when splitting or merging lanes pays off. |
+| Token streaming | Each token goes to its client as soon as it's sampled: `POST /v1/completions` with `stream: true`. |
+| Token-budget admission control | Each lane reserves `rows × max(prompt + max_tokens)` KV slots against a budget sized from free GPU memory. A prefill micro-batch can't exceed `max_prefill_tokens` padded tokens. |
+| Backpressure | When `max_queue` requests are already waiting, new ones get `429` with `Retry-After`. Requests that wait longer than `queue_timeout_s` get `503`. |
+| Benchmarks | A closed-loop sweep, a burst test and a PyTorch Profiler run, compared against a request-at-a-time baseline and vLLM. |
 
-**Scope.** This is an engine of its own: the scheduler, KV-cache manager and model forward pass are written in this project in PyTorch. The model weights come from Hugging Face. vLLM is used only as a comparison point.
+**Model:** Qwen2.5-1.5B-Instruct in fp16 by default. Any Hugging Face causal LM whose cache is a `DynamicCache` with per-layer `keys`/`values` tensors works.
 
-**Out of scope:** multi-GPU or multi-node serving, quantization, LoRA serving, authentication, and production deployment.
+**Out of scope:** multi-GPU serving, quantization, LoRA, authentication, chat templates (the API is raw completions).
 
 ---
 
-## 2. Goals and how they are measured
+## 2. What it measures
 
-These are targets, not results. Each one is measured by the benchmark harness described in [§6](#6-benchmark-methodology).
-
-| Target | Metric definition | Compared against |
+| Metric | Definition | Where it comes from |
 |---|---|---|
-| About 6× higher throughput at 32 concurrent users | Output tokens per second, summed over all requests during the measurement window | Naive baseline |
-| About 80% lower p99 latency at 32 concurrent users | 99th percentile of end-to-end request latency (request sent → last token received) | Naive baseline |
-| Time to first token (TTFT) under 200 ms | Time from request sent to first streamed token, reported at p50 and p99 | Naive baseline (seconds under load) |
-| Zero OOM crashes under 2× burst | Count of CUDA OOM errors and server crashes while load runs at 2× the steady-state level ([§6.3](#63-burst-test)) | Naive baseline with admission control off |
-| Competitive with vLLM | Same metrics, reported side by side. No target ratio; vLLM is the reference. | vLLM |
+| Throughput | Output tokens per second over the measurement window | `bench/load_test.py` |
+| TTFT | Request sent → first streamed chunk received, p50 and p99 | `bench/load_test.py` |
+| End-to-end latency | Request sent → last chunk received, p50 and p99 | `bench/load_test.py` |
+| Inter-token latency | (last chunk − first chunk) / (tokens − 1), p50 and p99 | `bench/load_test.py` |
+| OOM count | CUDA out-of-memory errors caught by the engine | `/stats` → `ooms` |
+| Peak GPU memory | `torch.cuda.max_memory_allocated()` | `/stats` → `gpu_peak_bytes` |
+| Padded tokens | Prefill: `rows × width − Σ prompt_len`. Decode: `rows × cache_width − Σ cached_len`, summed per step | `/stats`, `bench/profile_decode.py` |
+| Padding share of decode time | KV padding slots × calibrated cost per slot ÷ total decode time | `bench/profile_decode.py` |
 
-See [§12](#12-known-constraints-and-risks) for when the TTFT target is and isn't achievable on a T4.
+`bench/report.py` turns these into `results/summary.md` with these headline rows at 32 users:
+- micro-batching vs naive
+- bucketed vs unbucketed
+- gateway vs vLLM
+- TTFT naive vs gateway
+- p99 reduction
+- padding figures from the profiler
 
 ---
 
 ## 3. Architecture
 
 ```
- clients (load generator / curl)
-        │  HTTP POST /v1/completions  (stream=true → SSE)
-        ▼
-┌─────────────────────────── API process ───────────────────────────┐
-│  FastAPI + uvicorn (asyncio event loop)                            │
-│    ├─ request validation (pydantic)                                │
-│    ├─ admission check #1: queue length  ──► 429 if full            │
-│    └─ per-request asyncio.Queue  ◄── tokens pushed by engine       │
-│                         │ submit                                    │
-│                         ▼                                           │
-│  Engine thread (owns the GPU)                                       │
-│    loop:                                                            │
-│      1. Scheduler picks the batch for this step                     │
-│           - admission check #2: free KV blocks                      │
-│           - preempt if decode would run out of blocks               │
-│      2. Model runner: one forward pass (prefill and/or decode)      │
-│      3. Sampler: next token per sequence                            │
-│      4. Push tokens to request queues; free finished sequences      │
-│                                                                     │
-│  KV-cache manager: fixed pool of GPU memory, allocated per sequence │
-│  Metrics: Prometheus counters/histograms at GET /metrics            │
-└─────────────────────────────────────────────────────────────────────┘
+ client ── POST /v1/completions ──▶ FastAPI handler (asyncio event loop)
+                                       │ tokenize, build Sequence(outbox = asyncio.Queue)
+                                       │ Scheduler.submit()  ── 400 too large / 429 queue full
+                                       ▼
+                               waiting list (locked)
+                                       │
+ ┌──────────────────── engine thread (owns the GPU) ─────────────────────┐
+ │ loop:                                                                  │
+ │   expire stale waiting requests ─────────────────────────────▶ 503     │
+ │   admit: pick a micro-batch for one lane (budget, prefill cap,         │
+ │          free rows) → prefill → merge into the lane → evict finished   │
+ │   decode: one forward pass per lane → sample → push tokens → evict     │
+ │   every N steps: rebalance lanes (split or merge using the cost model) │
+ └────────────────────────────────────────────────────────────────────────┘
+                                       │ loop.call_soon_threadsafe(outbox.put_nowait, token)
+                                       ▼
+ FastAPI handler: incremental detokenize → stop strings → SSE chunks → data: [DONE]
 ```
 
-**Why a separate engine thread.** GPU calls block. If they ran on the asyncio event loop, the server couldn't accept connections or flush streamed tokens during a forward pass. The engine runs in one dedicated thread and hands tokens back to the event loop with `loop.call_soon_threadsafe`.
-
-**Why one process.** Splitting the API and engine into separate processes, as vLLM does, takes CPU work such as tokenization and HTTP handling off the engine's critical path. It also adds inter-process communication. This project starts with one process and measures CPU overhead before deciding to split ([§11.8](#118-process-model)).
+- **Threads:** the asyncio event loop handles HTTP and streaming. One engine thread runs every GPU call. They communicate only through the locked waiting list, per-request `asyncio.Queue`s, and a `cancelled` flag.
+- **Batch state:** each lane is a `Batch`: a list of sequences plus a left-padded KV cache `[rows, kv_heads, width, head_dim]` per layer, an attention mask `[rows, width]`, and per-row next position, last token, temperature and top-p.
 
 ---
 
 ## 4. Components
 
-### 4.1 API server
+### 4.1 API server: `gateway/server.py`, `gateway/protocol.py`
 
-- **Framework:** FastAPI on uvicorn.
-- **Endpoints:**
-  - `POST /v1/completions`: an OpenAI-compatible subset. The fields are `model`, `prompt`, `max_tokens`, `temperature`, `top_p`, `stream` and `stop`. With `stream: true`, the response is SSE `data:` chunks ending in `data: [DONE]`.
-  - `GET /health`: liveness check.
-  - `GET /metrics`: Prometheus text format.
-- **Why OpenAI-compatible:** the gateway, the naive baseline and vLLM then all accept the same requests. One load generator and one dataset can test all three, which makes the comparison fair.
-- **Client disconnects:** when a client drops its connection, the request is aborted and its KV blocks are freed.
+- `POST /v1/completions` takes these fields:
+  - `prompt` (string or list of token ids)
+  - `max_tokens`, `temperature`, `top_p`
+  - `stream`, `stop`
+  - `ignore_eos`
+  - `stream_options.include_usage`
+- `GET /health`, `GET /v1/models`, `GET /metrics` (Prometheus), `GET /stats` (JSON snapshot used by the benchmarks).
+- The handler waits for the first item from the engine *before* opening the stream. Queue timeouts and OOMs therefore come back as real HTTP status codes (503), not as a 200 with an error inside.
+- `TextStream` decodes the full token list on each new token and holds back text that ends in an incomplete UTF-8 character. It also holds back the last `len(stop) − 1` characters, so a stop string split across tokens is still caught.
+- When a client disconnects, the request is cancelled and its row is evicted on the next step.
 
-### 4.2 Admission controller
+### 4.2 Scheduler: `gateway/scheduler.py`
 
-Admission happens at two points:
+One `step()` does the following:
 
-1. **At the door (API).** If the waiting queue holds `max_queue_len` requests, the new request gets `429 Too Many Requests` with a `Retry-After` header. A request that waits longer than `queue_timeout_s` gets `503`.
-2. **At the GPU (scheduler).** A waiting request moves to running only if the KV-cache manager has enough free blocks for it ([§11.4](#114-kv-memory-reservation-policy)).
+1. `_expire`: fails requests that have waited longer than `queue_timeout_s`.
+2. `_admit`: if there are free rows and the oldest waiting request is ready, routes it to a lane, builds a micro-batch from waiting requests routed to the same lane, reserves budget, prefills, merges, and evicts anything that already finished.
+   - *Ready* means either the oldest has waited `max_wait_ms` (idle) or `join_wait_ms` (busy), or enough requests are waiting to fill the free rows.
+3. `_decode`: one forward pass per lane.
+4. Every `rebalance_every` steps, `rebalance`:
+   - splits the most-padded lane at the length cut that saves the most padding, if that saving is worth more than one extra forward pass;
+   - otherwise merges the two adjacent lanes whose combined padding grows the least, if that growth costs less than half a forward pass.
 
-Together these cap GPU memory use at a fixed budget no matter how many requests arrive. That cap is the mechanism behind the zero-OOM target.
+The oldest waiting request always seeds the next micro-batch, so nothing starves.
 
-### 4.3 Scheduler
+### 4.3 Engine: `gateway/engine.py`
 
-The scheduler runs once per engine step and uses iteration-level ("continuous") batching, the technique introduced by the Orca paper and used by vLLM. Each step it:
+- **`prefill(seqs)`:** left-pads prompts into `[rows, width]` and sets `position_ids = cumsum(mask) − 1` so padding doesn't shift positions. Runs the model with `logits_to_keep=1`, so only the last position's logits are computed (vocab is 151,936, so full prefill logits would be huge). Returns a new `Batch` and the first token for each row.
+- **`decode(batch)`:** appends a `1` column to the mask and feeds each row's last token at its own position. HF's `DynamicCache` appends the new K/V.
+- **`merge(a, b)`:** builds one zero tensor of the combined shape and copies each batch into it right-aligned (`stack_left`). One copy per layer.
+- **`evict(batch)` / `take(batch, rows)`:** `index_select`s the kept rows and drops leading columns that are now padding for every remaining row. One copy per layer.
+- **`calibrate()`:** times decode steps at two cache widths to fit `step_time ≈ fixed + per_slot × rows × width`.
+- **`sample()`:** greedy where `temperature == 0`; otherwise temperature plus top-p via sort/cumsum/multinomial, vectorized across rows.
 
-1. Removes finished sequences and frees their KV blocks.
-2. If the running sequences need more blocks than are free, preempts the most recently admitted sequence. That sequence's KV is discarded and it goes back to the front of the waiting queue to be recomputed later.
-3. Admits waiting requests in FIFO order while all of these hold: `running < max_num_seqs`, tokens this step `≤ max_num_batched_tokens`, and enough free blocks.
-4. Builds the step's batch from new prompts (prefill) and running sequences (one decode token each).
+### 4.4 Admission: `gateway/admission.py`
 
-How prefill and decode share a step is an open decision ([§11.3](#113-prefill--decode-scheduling-policy)).
+- `TokenBudget`: a thread-safe counter of reserved KV slots.
+- `size_budget`: `(free_gpu_bytes × kv_memory_fraction − max_prefill_tokens × activation_bytes_per_token) / kv_bytes_per_token`.
+  - For Qwen2.5-1.5B, `kv_bytes_per_token = 2 × 28 layers × 2 kv_heads × 128 head_dim × 2 bytes = 28,672`.
+- A lane's reservation is `rows × max(prompt + max_tokens)`. A lane's KV tensor is `rows × width`, and width never exceeds the largest `prompt + max_tokens` among its rows, so the reservation is an upper bound on its real KV memory.
 
-### 4.4 KV-cache manager
+### 4.5 Metrics: `gateway/metrics.py`
 
-Each generated token depends on cached attention keys and values (the "KV cache") for every earlier token. The manager:
+Prometheus counters and histograms (TTFT, end-to-end latency, tokens, padding slots, micro-batch size, decode batch size, lane events, OOMs, rejections), plus a plain dict mirror served at `/stats`.
 
-- Preallocates one fixed pool of GPU memory at startup, sized by `kv_cache_memory_gb` or by a number of blocks.
-- Divides the pool into blocks of `block_size` tokens and keeps a free list.
-- Gives each sequence a block table that maps its token positions to physical blocks.
-- Reports how many blocks are in use and free, for admission control and metrics.
+### 4.6 Benchmarks: `bench/`
 
-How the attention kernel reads from this memory is an open decision ([§11.2](#112-kv-cache-layout)).
-
-Memory per token, fp16, `2 (K,V) × layers × kv_heads × head_dim × 2 bytes`:
-
-| Model | Layers | KV heads | Head dim | KV bytes/token | Weights (fp16) |
-|---|---|---|---|---|---|
-| Qwen2.5-0.5B-Instruct | 24 | 2 | 64 | 12 KB | ~1.0 GB |
-| Qwen2.5-1.5B-Instruct | 28 | 2 | 128 | 28 KB | ~3.1 GB |
-| TinyLlama-1.1B-Chat | 22 | 4 | 64 | 22 KB | ~2.2 GB |
-
-### 4.5 Model runner
-
-- A custom PyTorch forward pass for the Qwen2/Llama architecture: RMSNorm, rotary position embeddings (RoPE), grouped-query attention and a SwiGLU MLP. Qwen2 also adds biases to its Q, K and V projections.
-- Weights load from the Hugging Face `safetensors` files.
-- **Why custom instead of `transformers` `model.generate`:** `generate` assumes a fixed batch that starts and ends together. Continuous batching needs sequences of different lengths, at different stages, to share one forward pass and read from a KV cache this project controls.
-- **Correctness check:** a test compares the custom forward's logits with the Hugging Face reference model on the same input, within a set fp16 tolerance.
-- **Attention:** PyTorch `scaled_dot_product_attention` (SDPA). FlashAttention-2 does not support the T4 (Turing architecture), so it is not used.
-- **Precision:** fp16. The T4 has no native bf16 support.
-
-### 4.6 Sampler
-
-Per-sequence `temperature` and `top_p` are applied to the whole batch in one vectorized operation, and `temperature = 0` means greedy decoding. A sequence stops on `max_tokens`, an end-of-sequence token, or a `stop` string.
-
-### 4.7 Streaming and detokenization
-
-Each request has an `asyncio.Queue`. The engine pushes new token IDs into it. The API side decodes them incrementally into text and writes SSE chunks. Decoding is incremental because one token isn't always a complete character: a multi-byte character can be split across tokens. Text is emitted only once it decodes cleanly.
-
-### 4.8 Metrics
-
-Exported through `prometheus_client` at `/metrics` and also logged per request for the benchmark:
-
-- TTFT, inter-token latency (ITL), end-to-end latency (histograms)
-- Throughput: output tokens/s and requests/s
-- Queue depth, running sequences, KV blocks used/free
-- Rejections (429/503), preemptions, OOM count
-- GPU memory allocated, from `torch.cuda.memory_allocated`
+| File | What it does |
+|---|---|
+| `workload.py` | Deterministic mixed-length jobs. Prompt lengths are drawn from 64/128/256/512-token buckets and outputs from 32/64/128/256-token buckets, with each length uniform within the upper half of its bucket. Prompts are sent as token ids, so lengths are exact. |
+| `load_test.py` | Closed-loop sweep (N users, each sends its next request when the last finishes, first N requests discarded as warm-up). Burst mode steps from `base` to `peak` users and back. |
+| `profile_decode.py` | Runs the real scheduler in-process with 32 simulated users, with lanes off and on. Records a PyTorch Profiler trace and op table for the FIFO run, times each engine phase, counts padded tokens, and converts KV padding into time using the calibrated per-slot cost. |
+| `report.py` | Builds `results/summary.md` and three plots. |
 
 ---
 
-## 5. Baselines
+## 5. Server presets and baselines
 
-| Baseline | What it is | Why it is included |
-|---|---|---|
-| **Naive** | The same FastAPI interface, serving one request at a time with Hugging Face `model.generate` and `TextIteratorStreamer` behind a lock. | The "before" picture. All throughput and latency targets are measured against it. |
-| **Static batching** (optional) | Collects up to N requests or waits T ms, then runs one padded `generate` call. No request joins or leaves mid-batch. | Shows why *continuous* batching matters, not just batching. Short requests wait for the longest one in their batch. |
-| **vLLM** | `vllm serve <model>` with the same model, dtype, and max context. | The industry-standard reference. |
+| Preset | Batch size | Lanes | Admission | Purpose |
+|---|---|---|---|---|
+| `naive` | 1 | 1 | off | Request-at-a-time baseline, same code path |
+| `unbucketed` | 32 | 1 | on | Micro-batching without length bucketing |
+| `gateway` | 32 | up to 3, cost-model driven | on | Full system |
+| `unguarded` | 256 | up to 3 | off | Burst test without admission control |
+| vLLM | its own scheduler | — | its own | Reference engine, same model, `--dtype half` |
 
-All three serve the same model in fp16 on the same GPU and are tested with the same client and workload.
+The naive baseline is the same server with batch size 1. Tokenizer, sampling, streaming and HTTP are identical, so the comparison isolates batching.
 
 ---
 
 ## 6. Benchmark methodology
 
-### 6.1 Load generator
-
-The load generator is an async Python client (`asyncio` + `httpx`). It opens N concurrent streaming requests and records per-request TTFT, ITL, end-to-end latency and token counts from the SSE stream. The options are listed in [§11.6](#116-load-generator).
-
-### 6.2 Steady-state test
-
-- Concurrency levels: 1, 4, 8, 16, 32, with 32 as the headline number.
-- Each level runs for a fixed number of requests after a warm-up, so CUDA kernel compilation and memory allocation aren't counted.
-- Outputs per level: throughput, TTFT p50/p99, end-to-end p50/p99, ITL p50/p99.
-
-### 6.3 Burst test
-
-- Load runs at 32 concurrent users and steps up to 64 (2×) for a fixed window, then drops back.
-- Pass criteria: no OOM, no server crash, every request either completes or gets an explicit 429/503, and throughput recovers after the burst.
-- Repeated with admission control turned off to show the failure mode it prevents. The KV budget may need to be capped to make the failure visible ([§12](#12-known-constraints-and-risks)).
-
-### 6.4 Workload
-
-The dataset choice is open ([§11.5](#115-benchmark-workload)). The same prompts, the same seed and the same `max_tokens` are used for every system.
-
-### 6.5 Reporting
-
-Results are saved as JSON per run (system, model, GPU, config, git commit, per-request records). A report script uses `matplotlib` to plot throughput vs concurrency, latency percentiles vs concurrency, and a burst timeline.
+- **Same inputs for every system:** same model and dtype, same token-id prompts, `temperature = 0`, `ignore_eos = true`. Every request generates exactly `max_tokens`, so output length doesn't depend on the system.
+- **Steady state:** 1, 8, 16 and 32 users, 6 measured requests per user (minimum 24), after one warm-up request per user.
+- **Burst:** 32 users for 30 s, 64 users for 60 s, back to 32 for 30 s. The burst uses longer prompts (up to 1536 tokens) and outputs (up to 384) to put pressure on memory. It runs for `gateway` and `unguarded`. Status codes, server-side OOM count and peak GPU memory are recorded.
+- **Profiler:** 160 requests, 32 simulated users, batch 32, lanes off vs on, on the same model and GPU.
+- **Same host:** the server and the client run on the same machine over `localhost`, so network latency is excluded.
 
 ---
 
@@ -216,215 +178,127 @@ Results are saved as JSON per run (system, model, GPU, config, git commit, per-r
 
 | Layer | Choice | License | Cost |
 |---|---|---|---|
-| Language | Python 3.10+ | PSF | $0 |
-| Tensor / GPU | PyTorch (CUDA) | BSD-3 | $0 |
-| Weights, tokenizer | `transformers`, `safetensors`, `tokenizers` (Hugging Face Hub) | Apache-2.0 | $0 |
+| Language | Python ≥ 3.10 | PSF | $0 |
+| Inference | PyTorch (SDPA attention), Hugging Face `transformers` ≥ 4.56 | BSD-3 / Apache-2.0 | $0 |
 | API | FastAPI, uvicorn, pydantic | MIT / BSD | $0 |
-| HTTP client | httpx | BSD-3 | $0 |
-| Metrics | prometheus_client | Apache-2.0 | $0 |
+| Metrics | prometheus-client | Apache-2.0 | $0 |
+| Load testing | httpx, numpy | BSD | $0 |
 | Plots | matplotlib | PSF-based | $0 |
-| Tests | pytest | MIT | $0 |
-| Reference engine | vLLM | Apache-2.0 | $0 |
-| Model | Qwen2.5-0.5B/1.5B-Instruct (Apache-2.0) or TinyLlama-1.1B (Apache-2.0) | see [§11.1](#111-model) | $0 |
-| GPU | Google Colab free tier (NVIDIA T4, 16 GB) | — | $0 |
-| CI | GitHub Actions, CPU-only tests (free for public repos) | — | $0 |
+| Reference | vLLM | Apache-2.0 | $0 |
+| Model | Qwen2.5-1.5B-Instruct | Apache-2.0 | $0 |
+| GPU | Google Colab free tier (T4, 16 GB) | — | $0 |
+| CI | GitHub Actions (public repo, CPU tests) | — | $0 |
+| Container | Docker, `pytorch/pytorch` CUDA runtime image | — | $0 |
 
-**About Colab Pro.** You have Colab Pro, but it is a paid subscription, so the project is designed to run fully on the free T4. Pro's faster GPUs (L4, A100) are an optional extra and spend monthly compute units. If you use them, report the GPU next to each result, because numbers from different GPUs aren't comparable. Free alternative: **Kaggle Notebooks** give about 30 GPU-hours a week (T4 ×2 or P100) with 12-hour sessions.
+Colab Pro's L4/A100 work too but aren't needed. Report the GPU with every result, because numbers from different GPUs aren't comparable. Kaggle (T4 ×2, about 30 GPU-hours a week) is the free fallback.
 
 ---
 
-## 8. Repository layout (planned)
+## 8. Repository layout
 
 ```
-LLM Inference Gateway/
-├── gateway/
-│   ├── api/
-│   │   ├── server.py        # FastAPI app, routes, SSE streaming
-│   │   └── protocol.py      # pydantic request/response schemas
-│   ├── engine/
-│   │   ├── engine.py        # engine thread and step loop
-│   │   ├── scheduler.py     # continuous batching, preemption
-│   │   ├── admission.py     # queue limits, timeouts
-│   │   ├── kv_cache.py      # block pool, block tables
-│   │   └── sequence.py      # per-request state
-│   ├── model/
-│   │   ├── qwen2.py         # custom forward pass
-│   │   ├── loader.py        # safetensors → custom model
-│   │   └── sampler.py
-│   ├── metrics.py
-│   └── config.py
-├── baselines/
-│   ├── naive_server.py
-│   └── static_batch_server.py   # optional
-├── bench/
-│   ├── load_test.py
-│   ├── workloads.py
-│   └── report.py
-├── notebooks/
-│   └── colab_benchmark.ipynb    # end-to-end run on Colab
-├── tests/
-├── docs/
-│   └── PROJECT.md
-└── pyproject.toml
+gateway/
+  config.py        Settings dataclass, presets, env parsing
+  model.py         device/dtype choice, model loading, KV and activation size math
+  engine.py        Sequence, Batch, ModelRunner (prefill, decode, merge, evict, take, calibrate), sampling
+  scheduler.py     admission, micro-batch selection, lanes, rebalancing, failure handling
+  admission.py     TokenBudget, budget sizing, QueueFull / RequestTooLarge
+  metrics.py       Prometheus metrics + /stats snapshot
+  protocol.py      request schema, incremental detokenizer, SSE chunk builders
+  server.py        FastAPI app, routes, CLI
+bench/
+  workload.py      mixed-length job generator
+  load_test.py     closed-loop and burst load generator
+  profile_decode.py  profiler and padding analysis
+  report.py        summary.md + plots
+scripts/run_benchmarks.sh   full benchmark sequence
+notebooks/colab_benchmark.ipynb
+tests/             engine equivalence, scheduler, server tests (tiny random model, CPU)
+Dockerfile, docker-compose.yml, .github/workflows/ci.yml
 ```
 
 ---
 
-## 9. Setup and running for free
+## 9. Setup and running
 
-> These are the intended steps. The commands will work once the code in §8 exists.
-
-### 9.1 Local development (no GPU)
-
-For CPU-only unit tests: scheduler logic, the KV block allocator, admission control, and the protocol.
+### 9.1 Local
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-pytest
+pytest -q
+python -m gateway.server --model Qwen/Qwen2.5-0.5B-Instruct
 ```
 
-The tests use a tiny model on CPU, so no GPU is needed. On an Apple Silicon Mac, PyTorch's `mps` backend can run the custom model for smoke tests. vLLM cannot run there because it needs an NVIDIA GPU.
+The tests use a randomly initialized 2-layer Qwen2 model on CPU, so they download nothing. On Apple Silicon the server runs on `mps`.
 
-### 9.2 GPU runs on Google Colab (free T4)
+### 9.2 Colab (free T4)
 
-1. Open `notebooks/colab_benchmark.ipynb` in Colab.
-2. Choose **Runtime → Change runtime type → T4 GPU**.
-3. Run the setup cell. It clones the repo and runs `pip install -e .` (plus `pip install vllm` for the vLLM comparison).
-4. Start the server in the background from a cell:
-   ```bash
-   nohup python -m gateway.api.server --model Qwen/Qwen2.5-0.5B-Instruct --port 8000 > server.log 2>&1 &
-   ```
-5. Run the benchmark against `http://localhost:8000`:
-   ```bash
-   python -m bench.load_test --url http://localhost:8000 --concurrency 1,4,8,16,32 --out results/gateway.json
-   ```
-6. Repeat steps 4–5 for `baselines/naive_server.py` and for `vllm serve`, stopping each server before starting the next. Only one should hold the GPU at a time.
-7. Run `python -m bench.report results/` and download `results/` and the plots. Colab deletes local files when the session ends.
+1. Open `notebooks/colab_benchmark.ipynb` and choose **Runtime → Change runtime type → T4 GPU**.
+2. Run all cells. It installs the package and runs `scripts/run_benchmarks.sh` (naive, unbucketed, gateway, both burst runs, profiler). Then it installs vLLM, benchmarks it on port 8001, builds the report, and downloads `results.zip`.
 
-The server and load generator run on the same Colab VM and talk over `localhost`. That keeps network latency out of the measurements, and no tunnel or public endpoint is needed.
+vLLM is installed last because it pins its own torch build. On a T4 it must run with `--dtype half`, since bf16 needs compute capability 8.0.
 
-### 9.3 Quick manual test
+### 9.3 Docker
 
 ```bash
-curl -N http://localhost:8000/v1/completions -H "Content-Type: application/json" -d '{"model":"default","prompt":"Explain KV caching in one sentence.","max_tokens":64,"stream":true}'
+docker compose up --build
+```
+
+Needs an NVIDIA GPU and the NVIDIA Container Toolkit. The model cache is a named volume. Choose the preset with `GATEWAY_PRESET`.
+
+### 9.4 Manual request
+
+```bash
+curl -N localhost:8000/v1/completions -H 'Content-Type: application/json' -d '{"prompt":"Explain KV caching in one sentence.","max_tokens":64,"temperature":0,"stream":true}'
 ```
 
 ---
 
-## 10. Configuration (planned)
+## 10. Configuration reference
 
-| Setting | Meaning | Affects |
+Every field can be set with a CLI flag (`--max-batch-size`) or an env var (`GATEWAY_MAX_BATCH_SIZE`). `--preset` applies first, then explicit flags override it.
+
+| Setting | Default | Meaning |
 |---|---|---|
-| `model` | Hugging Face model ID | Memory, speed |
-| `max_model_len` | Max prompt + output tokens per request | KV per request |
-| `block_size` | Tokens per KV block | Fragmentation vs. bookkeeping |
-| `kv_cache_memory_gb` / `num_kv_blocks` | Size of the KV pool | Max concurrent tokens; OOM safety |
-| `max_num_seqs` | Max sequences running at once | Batch size, ITL |
-| `max_num_batched_tokens` | Max tokens processed in one step | Step time, TTFT vs. ITL |
-| `max_queue_len` | Waiting requests before 429 | Burst behavior |
-| `queue_timeout_s` | Max wait before 503 | Tail latency under overload |
+| `model` | `Qwen/Qwen2.5-1.5B-Instruct` | Hugging Face model id |
+| `max_model_len` | 2048 | Max `prompt + max_tokens` per request |
+| `max_batch_size` | 32 | Max sequences decoding at once, across all lanes |
+| `max_lanes` | 3 | Max length lanes |
+| `lane_split_factor` | 1.5 | Safety margin on the cost model: a split must save 1.5× a forward pass |
+| `rebalance_every` | 8 | Steps between lane rebalances |
+| `max_wait_ms` | 30 | When idle, how long the first request waits for others to batch with |
+| `join_wait_ms` | 15 | When busy, how long new requests wait to join as a group |
+| `max_prefill_tokens` | 8192 | Max padded tokens in one prefill micro-batch |
+| `token_budget` | 0 (auto) | KV slot budget; 0 sizes it from free GPU memory |
+| `kv_memory_fraction` | 0.85 | Share of free memory the budget may use |
+| `max_queue` | 48 | Waiting requests before 429 |
+| `queue_timeout_s` | 30 | Max wait before 503 |
+| `bucketing` | true | Enable lanes and lane-grouped prefill |
+| `admission` | true | Enable budget, prefill cap and queue limit |
 
 ---
 
-## 11. Open decisions
+## 11. Design decisions
 
-Every option below is free. Each one is your call.
-
-### 11.1 Model
-
-| Option | Pros | Cons |
-|---|---|---|
-| Qwen2.5-0.5B-Instruct | Fastest; smallest KV (12 KB/token); easiest to hit the TTFT target | Lower output quality; results look less impressive |
-| Qwen2.5-1.5B-Instruct | Realistic size; still fits a T4 easily | Prefill is about 3× slower than 0.5B; TTFT target harder |
-| TinyLlama-1.1B-Chat | Plain Llama architecture (no QKV bias) | Weaker model; 2k context |
-
-Qwen2.5-0.5B and 1.5B share one architecture, so the custom forward pass supports both. Llama-3.2-1B is also free but gated: it requires accepting Meta's license on Hugging Face.
-
-### 11.2 KV-cache layout
-
-| Option | How it works | Pros | Cons |
+| Decision | Chosen | Alternatives considered | Why |
 |---|---|---|---|
-| A. Slot-based contiguous | Preallocated `[max_num_seqs, max_model_len]` cache; each sequence gets one slot | Simplest; SDPA works directly | Reserves `max_model_len` for every request, so short requests waste memory and fewer fit |
-| B. Paged + gather | Block pool; before attention, gather a sequence's blocks into a contiguous tensor, then SDPA | Memory efficient; no custom kernels | Gather copies memory every step, which costs time |
-| C. Paged + Triton kernel | Custom attention kernel reads blocks in place, like vLLM's PagedAttention | Memory efficient and fast | Hardest to write and debug; Triton on T4 is supported but less tuned |
-
-A natural path is A first, to get a working baseline, then B, then C only if profiling shows the gather is the bottleneck.
-
-### 11.3 Prefill / decode scheduling policy
-
-| Option | Pros | Cons |
-|---|---|---|
-| Prefill-first | Lowest TTFT for new requests | Running requests pause during long prefills (ITL spikes) |
-| Decode-first | Smooth streaming for running requests | New requests wait longer (higher TTFT) |
-| Chunked prefill | Splits long prompts across steps alongside decodes; balances TTFT and ITL | More complex scheduler and attention masking |
-
-### 11.4 KV memory reservation policy
-
-| Option | Pros | Cons |
-|---|---|---|
-| Reserve `prompt + max_tokens` at admission | Never needs preemption; simple; OOM impossible by construction | Over-reserves (most requests stop early), so fewer run at once and throughput is lower |
-| Reserve on demand + preemption | Higher memory use, so higher throughput | Must implement preemption and recompute; preempted requests see latency spikes |
-
-### 11.5 Benchmark workload
-
-| Option | Pros | Cons |
-|---|---|---|
-| Fixed synthetic lengths (e.g., 512 in / 128 out) | Reproducible; easy to reason about | Unrealistic; hides the gains from requests of different lengths |
-| ShareGPT conversations (free on Hugging Face; used by vLLM's own benchmarks) | Realistic length distribution; directly comparable to published numbers | Needs filtering and truncation; results vary more |
-| Both | Clean numbers plus realistic numbers | More runs on a time-limited GPU |
-
-### 11.6 Load generator
-
-| Option | Pros | Cons |
-|---|---|---|
-| Custom asyncio + httpx script | Exact TTFT/ITL measurement; full control over burst shape | Code to write and maintain |
-| vLLM's built-in serving benchmark (`vllm bench serve`; older versions: `benchmarks/benchmark_serving.py`) | Standard tool; reports TTFT/ITL/throughput; works against any OpenAI-compatible server | Less control over custom burst patterns; interface changes between vLLM versions |
-| Locust | Mature; web UI | Built for request/response, so streaming TTFT is awkward to measure |
-
-### 11.7 Streaming transport
-
-| Option | Pros | Cons |
-|---|---|---|
-| SSE | OpenAI-compatible; works with curl and benchmark tools; one-way fits token streaming | Text-only; one request per connection |
-| WebSocket | Bidirectional; can cancel or send multiple messages on one connection | Not OpenAI-compatible, so the shared benchmark tools can't use it |
-
-### 11.8 Process model
-
-| Option | Pros | Cons |
-|---|---|---|
-| Single process, engine thread | Simplest; no inter-process communication | Python's GIL can make HTTP, tokenization and the engine loop compete for CPU |
-| API and engine in separate processes (ZeroMQ or `multiprocessing` queues) | Engine loop isolated from HTTP overhead | More code; serialization cost; harder to debug |
-
-### 11.9 GPU platform
-
-| Option | Pros | Cons |
-|---|---|---|
-| Colab free (T4) | Zero cost; simple | Session limits; GPU not guaranteed; 2 vCPUs |
-| Kaggle (T4 ×2 / P100) | Zero cost; about 30 GPU-h/week; 12h sessions | Weekly quota; notebook-only workflow |
-| Colab Pro (L4 / A100) | Faster; newer GPUs (FlashAttention-capable) | Paid (already owned); compute units run out; results not comparable to T4 runs |
+| Batching granularity | Join at step boundaries, evict finished rows | Run each micro-batch to completion | Run-to-completion makes every row wait for the longest one. In early local tests it barely beat naive. |
+| KV layout | HF `DynamicCache`, left-padded, one tensor per layer per lane | Paged KV with a custom attention kernel | Paged attention needs custom kernels. Left padding works with stock SDPA and keeps the code reviewable. Padding is then the cost to manage, and the lanes manage it. |
+| Length bucketing | Lanes split and merged by a calibrated cost model | Fixed buckets; no bucketing | Fixed buckets cut padding but add a forward pass per bucket. Whether that pays off depends on the GPU and model, so the engine measures it instead of guessing. |
+| Memory reservation | Reserve `rows × max need` per lane up front | Reserve on demand and preempt | Safe by construction: a lane can never outgrow its reservation, so there's no preemption logic. Costs some over-reservation. |
+| Concurrency | Single process: asyncio for HTTP, one engine thread | Separate API and engine processes | No inter-process communication or serialization. The GIL is the tradeoff, and it's watched via CPU usage. |
+| Baseline | Same server with batch size 1 | Separate `model.generate` server | Isolates batching as the only variable. |
+| Streaming | SSE, OpenAI-compatible | WebSocket | The same client can benchmark the gateway and vLLM. |
+| Attention | PyTorch SDPA | FlashAttention-2 | FA2 doesn't support the T4. |
 
 ---
 
-## 12. Known constraints and risks
+## 12. Known constraints
 
-- **TTFT under 200 ms depends on the setup.** If 32 requests arrive at the same instant, the last one waits for all 32 prompts to be prefilled. Rough estimate: 32 prompts of 512 tokens on Qwen2.5-1.5B on a T4 take more than a second in total, however they're batched. The target is realistic with Poisson (spread-out) arrivals, shorter prompts, or the 0.5B model. Report the arrival pattern alongside every TTFT number.
-- **A small model may not OOM even without admission control.** A T4 has 16 GB, and Qwen2.5-0.5B leaves about 14 GB for KV, which is over a million tokens. To show the zero-OOM mechanism working, the burst test may need a capped KV budget (`num_kv_blocks`) or long contexts. State this in the results.
-- **Colab has only 2 vCPUs.** The load generator, HTTP server, tokenizer and engine loop all share them. Monitor CPU use during benchmarks. If the CPU is saturated, the numbers measure CPU limits rather than the scheduler.
-- **vLLM on the T4.** Recent vLLM releases have changed their support for older GPUs. Check that the installed version runs on compute capability 7.5 (the T4). If it doesn't, pin an older version or run the vLLM comparison on Kaggle or an L4, and note which.
-- **Colab sessions are ephemeral.** Save results to Google Drive or download them after each run, and pin package versions so runs can be reproduced.
-- **The 6× and 80% targets are relative to the naive baseline.** The size of the gain depends on how the baseline is built. Document it exactly ([§5](#5-baselines)) so the comparison can be defended.
-
----
-
-## 13. Build order
-
-| Phase | Deliverable | Done when |
-|---|---|---|
-| 1 | Naive baseline server + load generator | Baseline numbers recorded at 1–32 concurrency |
-| 2 | Custom model forward + loader | Logits match the Hugging Face reference within tolerance |
-| 3 | Engine loop + continuous batching (slot-based KV) + SSE streaming | Gateway serves concurrent streaming requests correctly |
-| 4 | Admission control + metrics | Burst test passes; `/metrics` populated |
-| 5 | Paged KV cache, preemption, chunked prefill (per decisions in §11) | Throughput and latency improve with no correctness regressions |
-| 6 | vLLM comparison + report | Final plots and tables for all three systems |
+- **GQA under a padding mask:** HF's SDPA path expands the KV heads to all query heads when a padding mask is present (6× for Qwen2.5-1.5B). That makes padded slots expensive. It's the reason lanes exist and why the profiler measures padding time.
+- **DynamicCache growth:** the cache appends with `torch.cat`, so every decode step copies the whole cache. vLLM avoids this with preallocated paged blocks. This is part of the gap to vLLM.
+- **Python per-step overhead:** HF's forward pass runs Python for every layer on every step. vLLM uses CUDA graphs. This also contributes to the gap.
+- **Colab has 2 vCPUs:** the load generator, the HTTP server, detokenization and the engine loop share them. Watch CPU usage during runs.
+- **Burst OOM depends on workload:** whether `unguarded` actually runs out of memory depends on prompt lengths and GPU memory. The burst test uses long prompts for that reason. The claim to check is zero OOMs with admission on.
+- **vLLM on T4:** check that the installed vLLM version supports compute capability 7.5. Older guidance says T4 runs the V0 engine, and some models need SM80. Pin an earlier vLLM if the latest refuses the GPU.

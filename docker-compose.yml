@@ -1,0 +1,22 @@
+services:
+  gateway:
+    build: .
+    image: llm-inference-gateway:latest
+    ports:
+      - "8000:8000"
+    environment:
+      GATEWAY_MODEL: ${GATEWAY_MODEL:-Qwen/Qwen2.5-1.5B-Instruct}
+      GATEWAY_PRESET: ${GATEWAY_PRESET:-gateway}
+    command: []
+    volumes:
+      - hf-cache:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  hf-cache:

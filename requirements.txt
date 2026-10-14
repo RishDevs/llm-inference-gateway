@@ -1,0 +1,10 @@
+torch>=2.3
+transformers>=4.56
+safetensors
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.5
+prometheus-client>=0.20
+httpx>=0.27
+numpy>=1.24
+matplotlib>=3.7
