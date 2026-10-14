@@ -4,7 +4,7 @@ import threading
 
 import torch
 
-from .model import activation_bytes_per_token, kv_bytes_per_token
+from .model import activation_bytes_per_token, attention_scratch_bytes_per_token, kv_bytes_per_token
 
 
 class QueueFull(Exception):
@@ -60,4 +60,5 @@ def size_budget(settings, config, dtype, device) -> int | None:
     free, _ = torch.cuda.mem_get_info(device)
     headroom = settings.max_prefill_tokens * activation_bytes_per_token(config, dtype)
     usable = free * settings.kv_memory_fraction - headroom
-    return max(floor, int(usable // kv_bytes_per_token(config, dtype)))
+    per_token = kv_bytes_per_token(config, dtype) + attention_scratch_bytes_per_token(config, dtype)
+    return max(floor, int(usable // per_token))

@@ -65,3 +65,10 @@ def activation_bytes_per_token(config, dtype: torch.dtype) -> int:
     elt = torch.tensor([], dtype=dtype).element_size()
     per_token = 6 * config.hidden_size + 3 * config.intermediate_size
     return 2 * per_token * elt
+
+
+def attention_scratch_bytes_per_token(config, dtype: torch.dtype) -> int:
+    heads = config.num_attention_heads
+    head_dim = getattr(config, "head_dim", None) or config.hidden_size // heads
+    elt = torch.tensor([], dtype=dtype).element_size()
+    return 2 * heads * head_dim * elt
