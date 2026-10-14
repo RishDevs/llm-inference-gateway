@@ -106,6 +106,7 @@ def main(argv=None) -> None:
     p.add_argument("--batch", type=int, default=32)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default="results/profile")
+    p.add_argument("--trace-requests", type=int, default=40)
     p.add_argument("--no-trace", action="store_true")
     args = p.parse_args(argv)
 
@@ -123,7 +124,8 @@ def main(argv=None) -> None:
     if loaded.device.type == "cuda":
         activities.append(ProfilerActivity.CUDA)
     prof = profile(activities=activities)
-    fifo, _ = run(base, plain, jobs, args.users, costs, profiler=prof)
+    run(base, plain, jobs[: args.trace_requests], args.users, costs, profiler=prof)
+    fifo, _ = run(base, plain, jobs, args.users, costs)
     sort_key = "cuda_time_total" if loaded.device.type == "cuda" else "cpu_time_total"
     table = prof.key_averages().table(sort_by=sort_key, row_limit=30)
     (out / "fifo_top_ops.txt").write_text(table)
