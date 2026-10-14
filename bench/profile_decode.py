@@ -120,7 +120,15 @@ def main(argv=None) -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     costs = base.calibrate()
-    plain = Settings(model=args.model, max_batch_size=args.batch, max_wait_ms=0.0, join_wait_ms=0.0, bucketing=False)
+    longest = max(len(j.prompt_ids) + j.max_tokens for j in jobs)
+    plain = Settings(
+        model=args.model,
+        max_model_len=max(2048, longest),
+        max_batch_size=args.batch,
+        max_wait_ms=0.0,
+        join_wait_ms=0.0,
+        bucketing=False,
+    )
     run(base, plain, jobs[: args.users], args.users, costs)
 
     activities = [ProfilerActivity.CPU]
