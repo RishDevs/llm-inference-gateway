@@ -16,7 +16,8 @@ from gateway.engine import ModelRunner, Sequence, StepCost, sync
 from gateway.model import load
 from gateway.scheduler import Scheduler
 
-from .workload import mixed_jobs
+from .load_test import ints
+from .workload import OUTPUT_BUCKETS, PROMPT_BUCKETS, mixed_jobs
 
 
 class TimedRunner(ModelRunner):
@@ -107,12 +108,14 @@ def main(argv=None) -> None:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", default="results/profile")
     p.add_argument("--trace-requests", type=int, default=40)
+    p.add_argument("--prompt-buckets", type=ints, default=PROMPT_BUCKETS)
+    p.add_argument("--output-buckets", type=ints, default=OUTPUT_BUCKETS)
     p.add_argument("--no-trace", action="store_true")
     args = p.parse_args(argv)
 
     loaded = load(args.model, args.device)
     base = ModelRunner(loaded.model, loaded.pad_id, loaded.eos_ids, loaded.device, loaded.dtype)
-    jobs = mixed_jobs(loaded.tokenizer, args.requests, args.seed)
+    jobs = mixed_jobs(loaded.tokenizer, args.requests, args.seed, args.prompt_buckets, args.output_buckets)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 

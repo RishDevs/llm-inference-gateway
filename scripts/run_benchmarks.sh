@@ -77,7 +77,8 @@ fi
 
 if [[ "$PROFILE" == "1" ]]; then
   echo "== profiler"
-  python -m bench.profile_decode --model "$MODEL" "${DEVICE_ARGS[@]}" --trace-requests 6 --out "$OUT/profile"
+  python -m bench.profile_decode --model "$MODEL" "${DEVICE_ARGS[@]}" --trace-requests 6 \
+    --prompt-buckets "${PROMPTS:-64,128,256,512}" --output-buckets "${OUTPUTS:-32,64,128,256}" --out "$OUT/profile"
 fi
 
 python -m bench.report "$OUT"
