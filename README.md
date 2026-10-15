@@ -24,6 +24,41 @@ client ──HTTP/SSE──▶ FastAPI (asyncio) ──submit──▶ waiting q
 
 Details are in [docs/PROJECT.md](docs/PROJECT.md).
 
+## Results
+
+Measured on a Google Colab **Tesla T4 (15 GB)** with Qwen2.5-1.5B-Instruct in fp16. Every request generates exactly `max_tokens` (`ignore_eos`), the client and server share one machine, and each number comes from a single run.
+
+### 32 concurrent users, mixed prompts (64–512 tokens in, 32–256 out)
+
+| | Naive (batch 1) | Gateway | vLLM |
+|---|---|---|---|
+| Throughput | 23.7 tok/s | **282.1 tok/s (11.9×)** | 723.2 tok/s |
+| Median time to first token | 103.6 s | **158 ms** | 117 ms |
+| p99 end-to-end latency | 139.3 s | **24.7 s (−82%)** | 8.8 s |
+| Requests served | 192 / 192 | 192 / 192 | 192 / 192 |
+
+The gateway reaches **39% of vLLM's throughput** on the same GPU. The gap comes from vLLM's paged KV cache (no padding, no copying when requests join or leave), CUDA graphs, and custom kernels.
+
+### Long, mixed prompts (128–2048 tokens in, 64–512 out), 32 users
+
+| | One batch | Length lanes |
+|---|---|---|
+| Throughput | 114.5 tok/s | **134.5 tok/s (1.17×)** |
+| Median time to first token | 375 ms | 281 ms |
+| p99 end-to-end latency | 109.6 s | 90.3 s (−18%) |
+
+With the short-prompt workload, lanes made no difference (279.9 vs 282.1 tok/s): the cost model only splits when padding is expensive enough to pay for the extra forward pass.
+
+### Burst: 32 → 128 → 32 users, prompts up to 3,072 tokens
+
+| | Admission control on | Admission control off |
+|---|---|---|
+| Peak GPU memory | **7.0 GB / 15** | 14.1 GB / 15 |
+| OOM crashes | 0 | 0 |
+| Throughput during the spike | 45 tok/s | 91 tok/s |
+
+Admission control kept memory at half the GPU while the unguarded server came within about 1 GB of the limit. The cost is throughput during spikes: reserving every request's worst-case length turns extra load away with `429`. Reserving memory as tokens grow, with preemption, is the planned fix.
+
 ## Quick start
 
 ### Local (CPU or Apple Silicon)

@@ -1,12 +1,12 @@
 # Explaining and Defending the Project
 
-For demos, class presentations and interviews. Numbers in brackets like **[throughput ×]** come from `results/summary.md` after a T4 run. Fill them in from your own run and never quote a number you didn't measure.
+For demos, class presentations and interviews. All numbers come from a Google Colab T4 run with Qwen2.5-1.5B (see the README's Results section). Each is a single run.
 
 ---
 
 ## 1. The 30-second version
 
-I built a serving layer for a language model on a single free T4 GPU. Serving one request at a time leaves the GPU mostly idle and makes everyone queue. My gateway batches requests together, lets new requests join a batch that's already running, and streams tokens back as they're generated. It also reserves memory for each batch up front, so traffic bursts get a polite retry instead of crashing the server. At 32 concurrent users it gets **[throughput ×]** the throughput of a one-at-a-time baseline, cuts time to first token from **[naive TTFT]** to **[gateway TTFT]**, and reaches **[% of vLLM]** of vLLM's throughput on the same GPU.
+I built a serving layer for a language model on a single free T4 GPU. Serving one request at a time leaves the GPU mostly idle and makes everyone queue. My gateway batches requests together, lets new requests join a batch that's already running, and streams tokens back as they're generated. It also reserves memory for each batch up front, so traffic bursts get a polite retry instead of crashing the server. At 32 concurrent users it gets **11.9×** the throughput of a one-at-a-time baseline, cuts time to first token from **104 seconds** to **158 milliseconds**, and reaches **39%** of vLLM's throughput on the same GPU.
 
 ## 2. The 2-minute version
 
@@ -18,7 +18,7 @@ My gateway sits in front of Qwen2.5-1.5B and fixes that in three ways.
 
 **Second, admission control.** Each batch reserves its worst-case KV-cache footprint against a budget computed from free GPU memory. Prefill size is capped, and if the queue is full the server returns 429 with Retry-After. Memory can't be oversubscribed, so OOMs can't happen.
 
-**Third, padding.** Batching variable-length text means padding. I profiled it and found padding was **[padding share]** of decode time, made worse because Hugging Face's attention expands the KV cache six times when a padding mask is present. So I added length lanes: the running set can split into short and long groups. A cost model the engine calibrates at startup decides when a split saves more than the extra forward pass costs.
+**Third, padding.** Batching variable-length text means padding. I profiled it and found padding was about **a third** of decode time (33% in my profiler run), made worse because Hugging Face's attention expands the KV cache six times when a padding mask is present. So I added length lanes: the running set can split into short and long groups. A cost model the engine calibrates at startup decides when a split saves more than the extra forward pass costs.
 
 I measured everything with a closed-loop load tester at 1 to 32 users, a burst test from 32 to 64 users, and PyTorch Profiler. The baseline is the same server with batch size 1, so batching is the only thing that changes. vLLM is the reference, and I can explain where the remaining gap comes from: paged attention, CUDA graphs, and no padding at all.
 
@@ -112,7 +112,7 @@ With left padding, every row's newest token is in the last column. Decode append
 It would if positions came from column index. I pass `position_ids = cumsum(mask) − 1`, so each row's real tokens get 0, 1, 2… regardless of padding, and decode uses each row's own `next_pos`. The equivalence tests confirm it.
 
 **Q7. Prove admission control prevents OOM.**
-A lane's KV memory is `rows × width × bytes_per_token`. Width is the longest live row, and each row's length is at most its `prompt + max_tokens`, so width ≤ the lane's max need. The reservation is `rows × max need`, so memory ≤ reservation. The sum of reservations ≤ budget, and the budget is free memory after weights, times 0.85, minus prefill headroom. Prefill activations are bounded by the prefill-token cap. The assumptions are the activation estimate and allocator fragmentation, which the 0.85 margin and `expandable_segments` cover. The burst test checks it empirically: **[OOM count]** OOMs with admission on, against **[unguarded result]** with it off.
+A lane's KV memory is `rows × width × bytes_per_token`. Width is the longest live row, and each row's length is at most its `prompt + max_tokens`, so width ≤ the lane's max need. The reservation is `rows × max need`, so memory ≤ reservation. The sum of reservations ≤ budget, and the budget is free memory after weights, times 0.85, minus prefill headroom. Prefill activations are bounded by the prefill-token cap. The assumptions are the activation estimate and allocator fragmentation, which the 0.85 margin and `expandable_segments` cover. The burst test checks it empirically: in a 32 → 128 user burst with prompts up to 3,072 tokens, admission control kept peak memory at 7.0 GB of 15 with zero OOMs, while the server without it peaked at 14.1 GB, about 1 GB from crashing.
 
 **Q8. What happens when the budget is exhausted?**
 The oldest waiting request stays at the front. It isn't skipped, so it can't starve. Smaller requests behind it can still be admitted if they fit. As rows finish, `_resize` releases budget immediately. If the queue reaches `max_queue`, new requests get 429. If a request waits longer than `queue_timeout_s`, it gets 503.
@@ -160,7 +160,7 @@ Per step it's O(waiting) to build the pool and O(rows²) for `best_cut` every 8 
 Because real memory is per lane. A request's KV occupies `lane_width` columns, not its own length, once it's in a padded batch. Per-request reservation would undercount padding and could OOM. This is also why lanes help admission: less padding means a smaller footprint for the same requests.
 
 **Q21. Is your cost model accurate?**
-It's a two-parameter linear fit measured at two widths. It ignores secondary effects: per-lane sampling and sync overhead, cache-growth copies, and the merge and split copies themselves. That's why the split threshold has a 1.5× margin and merging has hysteresis. On my Mac with the 0.5B model, even forced splitting lowered throughput while cutting padding by about half, and the calibrated model correctly declined to split. Whether lanes pay off on the T4 is a measured result, not an assumption.
+It's a two-parameter linear fit measured at two widths. It ignores secondary effects: per-lane sampling and sync overhead, cache-growth copies, and the merge and split copies themselves. That's why the split threshold has a 1.5× margin and merging has hysteresis. On my Mac with the 0.5B model, even forced splitting lowered throughput while cutting padding by about half, and the calibrated model correctly declined to split. On the T4, lanes made no difference with short prompts (279.9 vs 282.1 tok/s) and gave 1.17× throughput and 18% lower p99 latency with long, mixed prompts (128–2048 tokens).
 
 **Q22. Why only 32 rows max?**
 It covers the target load (32 users). Beyond that, padded KV traffic grows linearly with rows while the fixed weight-read cost is already amortized, so returns diminish, and memory spent on KV competes with prefill headroom. It's a flag, and the sweep can test other values.
