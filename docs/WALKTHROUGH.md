@@ -381,7 +381,7 @@ This is what makes the batching continuous: new requests start decoding alongsid
 
 ### 7.2 `TokenBudget`
 
-**Plain.** The fridge-space ledger. Before a group of dishes starts, its worst-case space is written down. When dishes finish, space is crossed off.
+**Plain.** The fridge-space ledger. Before each round, the space every pot will need for the next stir is written down. When dishes finish, space is crossed off. If there isn't enough room, the newest dish is set aside and finished later.
 
 **Technical.** A counter with `capacity` (`None` means unlimited) and `used`.
 - `fits(n)` checks whether `used + n ≤ capacity`.
@@ -397,10 +397,10 @@ The scheduler always passes deltas. A lane's reservation goes from `held` to `fo
 **Technical.**
 - With admission off it returns `None` (unlimited). An explicit `token_budget > 0` wins over the calculation.
 - On non-CUDA devices it returns `max_model_len × max_batch_size`, because there's no reliable free-memory call there.
-- On CUDA it runs after the model has loaded, so the weights are already subtracted: `torch.cuda.mem_get_info()` gives free bytes. It computes `usable = free × 0.85 − max_prefill_tokens × activation_bytes_per_token` and returns `usable // kv_bytes_per_token`.
+- On CUDA it runs after the model has loaded, so the weights are already subtracted: `torch.cuda.mem_get_info()` gives free bytes. It computes `usable = free × 0.85 − max_prefill_tokens × activation_bytes_per_token` and returns `usable // (kv_bytes_per_token + attention_scratch_bytes_per_token)`. The scratch term covers the temporary copy Hugging Face makes when it expands the 2 KV heads to all 12 query heads during attention.
 - The 0.85 leaves room for allocator fragmentation and CUDA workspace.
 
-**Why it's safe.** A lane's reservation is `rows × max(need)`. Its K/V tensors are `rows × width`, and width is at most the longest live row, which is at most that row's `need`. Real memory can't exceed the reservation, so the sum over lanes can't exceed the budget. Prefill activations are capped separately by `max_prefill_tokens`. Together these make OOM impossible by construction, as long as the estimates hold, which is what the burst test checks.
+**Why it's safe.** In the default `grow` mode, `_grow` reserves `rows × (width + 1)` before every decode step, exactly what that step will hold, and calls `_preempt` until the reservation fits. `_preempt` evicts the most recently admitted request and puts it back at the front of the queue. Because prefill feeds `prompt_ids + output_ids`, the request resumes exactly where it stopped. In `worst` mode (the `worstcase` preset) a lane reserves `rows × max(need)` up front instead, which needs no preemption but over-reserves. Either way real memory can't exceed the reservation, so the sum over lanes can't exceed the budget. Prefill activations are capped separately by `max_prefill_tokens`. Together these make OOM impossible by construction, as long as the estimates hold, which is what the burst test checks.
 
 ---
 
@@ -671,7 +671,7 @@ If you only learn eight things cold, learn these:
 2. **`logits_to_keep=1`** (`prefill`): skips about 10 GB of logits on a big prefill. Without it the burst test crashes on prefill alone.
 3. **`merge` with `stack_left`/`stack_mask`**: continuous batching. New requests join running ones at step boundaries.
 4. **`evict` / `take` with the lead trim**: frees rows and dead width right away. Without it the cache keeps its maximum width forever.
-5. **Reservation = `rows × max(need)` per lane** (`_pick`, `_resize`, `size_budget`): the proof that a lane can't outgrow its memory. That's why OOM can't happen with admission on.
+5. **Reserve-ahead plus preemption** (`footprint`, `_grow`, `_preempt`, `size_budget`): every step reserves exactly what it will hold, and the newest request is paused if that doesn't fit. That's why OOM can't happen with admission on.
 6. **`_pick`'s seed rule and caps**: oldest first (no starvation), prefill cap (bounds activation memory), footprint delta against the budget.
 7. **`call_soon_threadsafe` in `Sequence.push`**: the only correct way to hand data from the engine thread to asyncio.
 8. **Calibrated `StepCost` + `best_cut` + hysteresis** (`rebalance`): length bucketing that only happens when the measured cost model says it pays.

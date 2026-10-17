@@ -1,12 +1,12 @@
 # Explaining and Defending the Project
 
-For demos, class presentations and interviews. All numbers come from a Google Colab T4 run with Qwen2.5-1.5B (see the README's Results section). Each is a single run.
+For demos, class presentations and interviews. All numbers come from Google Colab T4 runs with Qwen2.5-1.5B (see the README's Results section). Steady-state numbers are means of 3 runs.
 
 ---
 
 ## 1. The 30-second version
 
-I built a serving layer for a language model on a single free T4 GPU. Serving one request at a time leaves the GPU mostly idle and makes everyone queue. My gateway batches requests together, lets new requests join a batch that's already running, and streams tokens back as they're generated. It also reserves memory for each batch up front, so traffic bursts get a polite retry instead of crashing the server. At 32 concurrent users it gets **11.9×** the throughput of a one-at-a-time baseline, cuts time to first token from **104 seconds** to **158 milliseconds**, and reaches **39%** of vLLM's throughput on the same GPU.
+I built a serving layer for a language model on a single free T4 GPU. Serving one request at a time leaves the GPU mostly idle and makes everyone queue. My gateway batches requests together, lets new requests join a batch that's already running, and streams tokens back as they're generated. It also reserves memory for each batch up front, so traffic bursts get a polite retry instead of crashing the server. At 32 concurrent users it gets **12×** the throughput of a one-at-a-time baseline, cuts time to first token from **109 seconds** to **150 milliseconds**, and reaches **39%** of vLLM's throughput on the same GPU.
 
 ## 2. The 2-minute version
 
@@ -16,7 +16,7 @@ My gateway sits in front of Qwen2.5-1.5B and fixes that in three ways.
 
 **First, batching.** Requests are prefilled in small groups and merged into a running batch at the next step boundary, and finished requests are evicted immediately. One weight read serves the whole batch, and nobody waits for a stranger's long answer to finish.
 
-**Second, admission control.** Each batch reserves its worst-case KV-cache footprint against a budget computed from free GPU memory. Prefill size is capped, and if the queue is full the server returns 429 with Retry-After. Memory can't be oversubscribed, so OOMs can't happen.
+**Second, admission control.** Each batch reserves the KV-cache memory it actually uses, one step ahead, against a budget computed from free GPU memory. When the budget runs out, the newest request is paused and resumed later (preemption). Prefill size is capped, and if the queue is full the server returns 429 with Retry-After. Memory can't be oversubscribed, so OOMs can't happen.
 
 **Third, padding.** Batching variable-length text means padding. I profiled it and found padding was about **a third** of decode time (33% in my profiler run), made worse because Hugging Face's attention expands the KV cache six times when a padding mask is present. So I added length lanes: the running set can split into short and long groups. A cost model the engine calibrates at startup decides when a split saves more than the extra forward pass costs.
 
@@ -57,9 +57,10 @@ Draw left to right while talking.
 - **Rejected 2: no bucketing.** That leaves a large share of decode time on padding.
 - **Why the cost model:** the right answer depends on the hardware. A forward pass costs `fixed + per_slot × slots`. Splitting a lane adds one `fixed` and saves `saved × per_slot`. I measure both at startup and split only when the saving beats the cost by 1.5×, merging back below half the cost so it doesn't flap.
 
-### Memory: reserve the worst case up front
-- **Rejected:** reserve as you go, and preempt (evict and recompute) when memory runs out.
-- **Why:** up-front reservation is safe by construction. A lane can never exceed `rows × max need`, so there's no preemption code and no recompute storms. The cost is over-reservation, since requests often stop before `max_tokens`. With a 1.5B model on a 16 GB T4 the budget is around 300k tokens, far above what 32–64 users need, so over-reserving doesn't limit admission here.
+### Memory: reserve as sequences grow, preempt when short
+- **Rejected:** reserving each request's worst case (`prompt + max_tokens`) up front. I built that first (it's still the `worstcase` preset). It's simple and safe, but it over-reserves, because most requests stop early or are far from their limit.
+- **Why:** each lane reserves `rows × (width + 1)`, exactly what the next step needs. If the budget can't cover the next step, the most recently admitted request is evicted and put back at the front of the queue. Later it's re-prefilled from its prompt plus the tokens it already produced, so its output is unchanged (a test checks this token for token). A 5% watermark stops new admissions just before the budget is full, so preemption stays rare.
+- **What I measured:** in the 128-user burst, grow mode and worst-case mode gave the same throughput, because the 32-row batch cap, not memory, was the binding limit. The payoff shows up when memory, not the batch cap, is the constraint.
 
 ### Admission: three separate limits
 - A queue cap (backpressure), a token budget (KV memory), and a prefill cap (activation memory).
@@ -112,7 +113,7 @@ With left padding, every row's newest token is in the last column. Decode append
 It would if positions came from column index. I pass `position_ids = cumsum(mask) − 1`, so each row's real tokens get 0, 1, 2… regardless of padding, and decode uses each row's own `next_pos`. The equivalence tests confirm it.
 
 **Q7. Prove admission control prevents OOM.**
-A lane's KV memory is `rows × width × bytes_per_token`. Width is the longest live row, and each row's length is at most its `prompt + max_tokens`, so width ≤ the lane's max need. The reservation is `rows × max need`, so memory ≤ reservation. The sum of reservations ≤ budget, and the budget is free memory after weights, times 0.85, minus prefill headroom. Prefill activations are bounded by the prefill-token cap. The assumptions are the activation estimate and allocator fragmentation, which the 0.85 margin and `expandable_segments` cover. The burst test checks it empirically: in a 32 → 128 user burst with prompts up to 3,072 tokens, admission control kept peak memory at 7.0 GB of 15 with zero OOMs, while the server without it peaked at 14.1 GB, about 1 GB from crashing.
+A lane's KV memory is `rows × width × bytes_per_token`. Before every decode step the scheduler reserves `rows × (width + 1)`, exactly what that step will hold, and preempts the newest request if the budget can't cover it. So memory never exceeds the reservation. The sum of reservations ≤ budget, and the budget is free memory after weights, times 0.85, minus prefill headroom. Prefill activations are bounded by the prefill-token cap. The assumptions are the activation estimate and allocator fragmentation, which the 0.85 margin and `expandable_segments` cover. The burst test checks it empirically: in a 32 → 128 user burst with prompts up to 3,072 tokens, admission control kept peak memory at 7.0 GB of 15 with zero OOMs, while the server without it hit 3 out-of-memory errors and failed 181 of 236 requests in the spike.
 
 **Q8. What happens when the budget is exhausted?**
 The oldest waiting request stays at the front. It isn't skipped, so it can't starve. Smaller requests behind it can still be admitted if they fit. As rows finish, `_resize` releases budget immediately. If the queue reaches `max_queue`, new requests get 429. If a request waits longer than `queue_timeout_s`, it gets 503.
@@ -160,7 +161,7 @@ Per step it's O(waiting) to build the pool and O(rows²) for `best_cut` every 8 
 Because real memory is per lane. A request's KV occupies `lane_width` columns, not its own length, once it's in a padded batch. Per-request reservation would undercount padding and could OOM. This is also why lanes help admission: less padding means a smaller footprint for the same requests.
 
 **Q21. Is your cost model accurate?**
-It's a two-parameter linear fit measured at two widths. It ignores secondary effects: per-lane sampling and sync overhead, cache-growth copies, and the merge and split copies themselves. That's why the split threshold has a 1.5× margin and merging has hysteresis. On my Mac with the 0.5B model, even forced splitting lowered throughput while cutting padding by about half, and the calibrated model correctly declined to split. On the T4, lanes made no difference with short prompts (279.9 vs 282.1 tok/s) and gave 1.17× throughput and 18% lower p99 latency with long, mixed prompts (128–2048 tokens).
+It's a two-parameter linear fit measured at two widths. It ignores secondary effects: per-lane sampling and sync overhead, cache-growth copies, and the merge and split copies themselves. That's why the split threshold has a 1.5× margin and merging has hysteresis. On my Mac with the 0.5B model, even forced splitting lowered throughput while cutting padding by about half, and the calibrated model correctly declined to split. On the T4, lanes made no difference with short prompts and gave 1.13× throughput and 12% lower p99 latency with long, mixed prompts (128–2048 tokens, mean of 3 runs), cutting padded KV tokens by 62%.
 
 **Q22. Why only 32 rows max?**
 It covers the target load (32 users). Beyond that, padded KV traffic grows linearly with rows while the fixed weight-read cost is already amortized, so returns diminish, and memory spent on KV competes with prefill headroom. It's a flag, and the sweep can test other values.
@@ -184,14 +185,14 @@ Yes. Start the server, send a streaming curl, open `/stats` and `/metrics` while
 - **Padded attention:** single GPU, left-padded batches, so padded positions still cost bandwidth. Lanes reduce it when the hardware makes that worth it.
 - **Cache growth copies:** HF's `DynamicCache` copies the cache on every append and on every join or evict.
 - **Python per layer:** the forward pass runs Python per layer per step; there are no CUDA graphs.
-- **Worst-case reservation:** reserving for `max_tokens` over-reserves when requests stop early.
+- **Preemption by recompute:** a paused request redoes its prefill when it resumes. Swapping its KV cache to CPU memory would avoid that work.
 - **No prefix caching:** two requests with the same system prompt each prefill it from scratch.
 - **Raw completions only:** no chat template, no authentication.
 
 **Version 2:**
 1. **Paged KV cache with a block allocator** and an attention kernel that reads pages in place (Triton). That means no padding, no join or evict copies, and admission per block instead of per worst case.
 2. **Chunked prefill.** Split long prompts across steps so they don't stall decode for everyone else.
-3. **Preemption with recompute,** so reservations can be optimistic and only the newest request gets bumped when memory runs short.
+3. **Swap-based preemption,** moving a paused request's KV cache to CPU memory instead of recomputing it.
 4. **Prefix caching,** to share KV for common prompt prefixes.
 5. **CUDA graphs for decode,** removing Python overhead per step.
 6. **A separate tokenizer/HTTP process,** taking CPU work off the engine's critical path.

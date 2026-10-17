@@ -7,7 +7,7 @@ A serving layer that sits in front of Qwen2.5-1.5B and serves many users at once
 - **Dynamic micro-batching:** new requests are prefilled together as a micro-batch and merged into the running batch at the next decode step. Finished requests leave right away, so nobody waits for someone else's long answer.
 - **Length-bucketed batching:** the running set can split into length lanes so short sequences don't carry the padding of long ones. A cost model calibrated on the GPU at startup decides when a split pays for its extra forward pass.
 - **Token streaming:** OpenAI-compatible `/v1/completions` with Server-Sent Events.
-- **Token-budget admission control and backpressure:** every batch reserves its padded KV-cache footprint against a budget sized from free GPU memory. Prefill size is capped. When the queue is full, the server returns `429` with `Retry-After`.
+- **Token-budget admission control and backpressure:** every batch reserves the padded KV-cache memory its next step needs against a budget sized from free GPU memory, and the newest request is paused and later resumed if memory runs short (preemption). Prefill size is capped. When the queue is full, the server returns `429` with `Retry-After`.
 - **Benchmarks:** closed-loop and burst load tests against a request-at-a-time baseline and against vLLM on the same GPU, plus a PyTorch Profiler run that measures padding waste.
 
 ## Architecture
@@ -26,16 +26,15 @@ Details are in [docs/PROJECT.md](docs/PROJECT.md).
 
 ## Results
 
-Measured on a Google Colab **Tesla T4 (15 GB)** with Qwen2.5-1.5B-Instruct in fp16. Every request generates exactly `max_tokens` (`ignore_eos`), the client and server share one machine, and each number comes from a single run.
+Measured on Google Colab **Tesla T4 (15 GB)** GPUs with Qwen2.5-1.5B-Instruct in fp16. Every request generates exactly `max_tokens` (`ignore_eos`), and the client and server share one machine. Steady-state numbers are the **mean ± standard deviation of 3 runs**, each with a different random workload.
 
 ### 32 concurrent users, mixed prompts (64–512 tokens in, 32–256 out)
 
 | | Naive (batch 1) | Gateway | vLLM |
 |---|---|---|---|
-| Throughput | 23.7 tok/s | **282.1 tok/s (11.9×)** | 723.2 tok/s |
-| Median time to first token | 103.6 s | **158 ms** | 117 ms |
-| p99 end-to-end latency | 139.3 s | **24.7 s (−82%)** | 8.8 s |
-| Requests served | 192 / 192 | 192 / 192 | 192 / 192 |
+| Throughput (tok/s) | 19.4 ± 1.1 | **236.3 ± 10.1 (12.2×)** | 602.1 ± 18.0 |
+| Median time to first token | 109 s | **150 ms** | 114 ms |
+| p99 end-to-end latency | 139 s | **22.7 s (−84%)** | 8.3 s |
 
 The gateway reaches **39% of vLLM's throughput** on the same GPU. The gap comes from vLLM's paged KV cache (no padding, no copying when requests join or leave), CUDA graphs, and custom kernels.
 
@@ -43,21 +42,21 @@ The gateway reaches **39% of vLLM's throughput** on the same GPU. The gap comes 
 
 | | One batch | Length lanes |
 |---|---|---|
-| Throughput | 114.5 tok/s | **134.5 tok/s (1.17×)** |
-| Median time to first token | 375 ms | 281 ms |
-| p99 end-to-end latency | 109.6 s | 90.3 s (−18%) |
+| Throughput (tok/s) | 108.8 ± 4.5 | **122.8 ± 3.2 (1.13×)** |
+| Median time to first token | 434 ms | 345 ms |
+| p99 end-to-end latency | 99.3 s | 87.1 s (−12%) |
 
-With the short-prompt workload, lanes made no difference (279.9 vs 282.1 tok/s): the cost model only splits when padding is expensive enough to pay for the extra forward pass.
+The profiler run on the same workload (in-process, 32 simulated users) shows lanes cut **padded KV tokens by 62%** and raised engine throughput 1.14×. With short prompts lanes make no difference: the cost model only splits when padding is expensive enough to pay for the extra forward pass.
 
 ### Burst: 32 → 128 → 32 users, prompts up to 3,072 tokens
 
 | | Admission control on | Admission control off |
 |---|---|---|
+| OOM errors | **0** | 3 |
+| Requests failed during the spike | 87 timed out (most extra load got a fast `429`) | **181 of 236 (77%)** |
 | Peak GPU memory | **7.0 GB / 15** | 14.1 GB / 15 |
-| OOM crashes | 0 | 0 |
-| Throughput during the spike | 45 tok/s | 91 tok/s |
 
-Admission control kept memory at half the GPU while the unguarded server came within about 1 GB of the limit. The cost is throughput during spikes: reserving every request's worst-case length turns extra load away with `429`. Reserving memory as tokens grow, with preemption, is the planned fix.
+Without admission control the server ran out of memory three times and failed most requests in the spike. With it, memory stayed at half the GPU and excess load was turned away early with `429`. Reserving memory as tokens grow (with preemption) made no throughput difference in this test, because the 32-row batch cap, not memory, was the binding limit.
 
 ## Quick start
 
@@ -92,6 +91,7 @@ docker compose up --build
 |---|---|
 | `gateway` | Micro-batching + length lanes + admission control (default) |
 | `unbucketed` | Same, but one running batch with no length lanes |
+| `worstcase` | Gateway with worst-case memory reservation instead of reserve-ahead + preemption |
 | `naive` | One request at a time: batch size 1, no admission control |
 | `unguarded` | Large batches with admission control off, used in the burst test |
 

@@ -30,7 +30,7 @@ A serving layer for one LLM on one GPU. It accepts OpenAI-style completion reque
 | Dynamic micro-batching | Waiting requests are prefilled together as a micro-batch, then merged into a running batch at the next step boundary. Finished requests are evicted from the batch right away. |
 | Length-bucketed batching | The running set can be split into up to `max_lanes` lanes by context length, so short sequences don't carry the padding of long ones. A cost model calibrated at startup decides when splitting or merging lanes pays off. |
 | Token streaming | Each token goes to its client as soon as it's sampled: `POST /v1/completions` with `stream: true`. |
-| Token-budget admission control | Each lane reserves `rows × max(prompt + max_tokens)` KV slots against a budget sized from free GPU memory. A prefill micro-batch can't exceed `max_prefill_tokens` padded tokens. |
+| Token-budget admission control | Each lane reserves `rows × (width + 1)` KV slots, what its next step needs, against a budget sized from free GPU memory. When the budget is short, the newest request is preempted and later resumed by re-prefilling its prompt plus generated tokens. A prefill micro-batch can't exceed `max_prefill_tokens` padded tokens. |
 | Backpressure | When `max_queue` requests are already waiting, new ones get `429` with `Retry-After`. Requests that wait longer than `queue_timeout_s` get `503`. |
 | Benchmarks | A closed-loop sweep, a burst test and a PyTorch Profiler run, compared against a request-at-a-time baseline and vLLM. |
 
@@ -133,7 +133,8 @@ The oldest waiting request always seeds the next micro-batch, so nothing starves
 - `TokenBudget`: a thread-safe counter of reserved KV slots.
 - `size_budget`: `(free_gpu_bytes × kv_memory_fraction − max_prefill_tokens × activation_bytes_per_token) / kv_bytes_per_token`.
   - For Qwen2.5-1.5B, `kv_bytes_per_token = 2 × 28 layers × 2 kv_heads × 128 head_dim × 2 bytes = 28,672`.
-- A lane's reservation is `rows × max(prompt + max_tokens)`. A lane's KV tensor is `rows × width`, and width never exceeds the largest `prompt + max_tokens` among its rows, so the reservation is an upper bound on its real KV memory.
+- In the default `grow` mode a lane reserves `rows × (width + 1)` before each decode step, exactly what that step holds, and preempts the newest request if the budget can't cover it. In `worst` mode (`worstcase` preset) it reserves `rows × max(prompt + max_tokens)` up front instead.
+- The per-token cost includes the temporary attention copy (KV heads expanded to all query heads), not just the KV cache itself.
 
 ### 4.5 Metrics: `gateway/metrics.py`
 
@@ -156,6 +157,7 @@ Prometheus counters and histograms (TTFT, end-to-end latency, tokens, padding sl
 |---|---|---|---|---|
 | `naive` | 1 | 1 | off | Request-at-a-time baseline, same code path |
 | `unbucketed` | 32 | 1 | on | Micro-batching without length bucketing |
+| `worstcase` | 32 | up to 3 | on, worst-case reservation | Admission control without preemption |
 | `gateway` | 32 | up to 3, cost-model driven | on | Full system |
 | `unguarded` | 256 | up to 3 | off | Burst test without admission control |
 | vLLM | its own scheduler | — | its own | Reference engine, same model, `--dtype half` |
@@ -272,6 +274,8 @@ Every field can be set with a CLI flag (`--max-batch-size`) or an env var (`GATE
 | `max_prefill_tokens` | 8192 | Max padded tokens in one prefill micro-batch |
 | `token_budget` | 0 (auto) | KV slot budget; 0 sizes it from free GPU memory |
 | `kv_memory_fraction` | 0.85 | Share of free memory the budget may use |
+| `reserve` | `grow` | `grow`: reserve one step ahead and preempt when short. `worst`: reserve each request's `prompt + max_tokens` up front |
+| `watermark` | 0.05 | In `grow` mode, share of the budget kept free when admitting new requests |
 | `max_queue` | 48 | Waiting requests before 429 |
 | `queue_timeout_s` | 30 | Max wait before 503 |
 | `bucketing` | true | Enable lanes and lane-grouped prefill |
@@ -286,7 +290,7 @@ Every field can be set with a CLI flag (`--max-batch-size`) or an env var (`GATE
 | Batching granularity | Join at step boundaries, evict finished rows | Run each micro-batch to completion | Run-to-completion makes every row wait for the longest one. In early local tests it barely beat naive. |
 | KV layout | HF `DynamicCache`, left-padded, one tensor per layer per lane | Paged KV with a custom attention kernel | Paged attention needs custom kernels. Left padding works with stock SDPA and keeps the code reviewable. Padding is then the cost to manage, and the lanes manage it. |
 | Length bucketing | Lanes split and merged by a calibrated cost model | Fixed buckets; no bucketing | Fixed buckets cut padding but add a forward pass per bucket. Whether that pays off depends on the GPU and model, so the engine measures it instead of guessing. |
-| Memory reservation | Reserve `rows × max need` per lane up front | Reserve on demand and preempt | Safe by construction: a lane can never outgrow its reservation, so there's no preemption logic. Costs some over-reservation. |
+| Memory reservation | Reserve one step ahead, preempt the newest request when short | Reserve each request's worst case up front (`worstcase` preset) | Worst-case reservation over-reserves because most requests are far from their limit. Reserve-ahead uses only what's needed; preemption by recompute keeps outputs identical. |
 | Concurrency | Single process: asyncio for HTTP, one engine thread | Separate API and engine processes | No inter-process communication or serialization. The GIL is the tradeoff, and it's watched via CPU usage. |
 | Baseline | Same server with batch size 1 | Separate `model.generate` server | Isolates batching as the only variable. |
 | Streaming | SSE, OpenAI-compatible | WebSocket | The same client can benchmark the gateway and vLLM. |
