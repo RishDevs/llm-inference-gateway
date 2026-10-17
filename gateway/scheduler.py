@@ -265,8 +265,11 @@ class Scheduler:
             if not self.budget.take(footprint - held):
                 return key, []
             self.reserved[key] = footprint
+            now = time.monotonic()
             for q in picked:
                 q.admitted = next(self._admit_ids)
+                if q.admitted_at is None:
+                    q.admitted_at = now
             chosen = set(id(q) for q in picked)
             self.waiting = [q for q in self.waiting if id(q) not in chosen]
         return key, picked

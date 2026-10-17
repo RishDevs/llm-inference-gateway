@@ -11,6 +11,8 @@ METRICS = [
     ("throughput_tok_s", "Throughput (tok/s)", 1.0, "{:.1f}"),
     ("ttft_p50_s", "TTFT p50 (ms)", 1000.0, "{:.0f}"),
     ("e2e_p99_s", "E2E p99 (s)", 1.0, "{:.2f}"),
+    ("queue_p50_s", "Server queue wait p50 (ms)", 1000.0, "{:.0f}"),
+    ("prefill_p50_s", "Server prefill p50 (ms)", 1000.0, "{:.0f}"),
 ]
 
 
@@ -25,7 +27,8 @@ def collect(folder: Path) -> dict:
             continue
         name = re.sub(r"-r\d+$", "", data["label"])
         for lv in data.get("levels", []):
-            s = lv["summary"]
+            s = dict(lv["summary"])
+            s.update({k: v for k, v in (lv.get("server") or {}).items() if k in ("queue_p50_s", "prefill_p50_s")})
             for key, *_ in METRICS:
                 if s.get(key) is not None:
                     groups[(name, lv["concurrency"])][key].append(s[key])
@@ -59,7 +62,7 @@ def main(argv=None) -> None:
     lines += ["|---|---|---|" + "---|" * len(METRICS)]
     for (name, c), vals in sorted(groups.items()):
         runs = max(len(v) for v in vals.values())
-        cells = [spread(vals[key], scale, fmt) if vals.get(key) else "—" for key, _, scale, fmt in METRICS]
+        cells = [spread(vals[key], scale, fmt) if key in vals else "—" for key, _, scale, fmt in METRICS]
         lines.append(f"| {name} | {c} | {runs} | " + " | ".join(cells) + " |")
 
     ratios = []

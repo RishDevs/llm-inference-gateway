@@ -3,8 +3,15 @@ set -euo pipefail
 
 ROOT="${ROOT:-results-final}"
 HERE="$(dirname "$0")"
+mkdir -p "$ROOT"
+{
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+  git -C "$HERE/.." rev-parse HEAD
+  nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader 2> /dev/null || true
+  python -c "import platform, torch, transformers; print(platform.python_version(), torch.__version__, transformers.__version__)"
+} > "$ROOT/environment.txt"
 
-OUT="$ROOT/short" REPEATS=3 LEVELS=32 PER_USER=3 PRESETS="naive gateway" BURST=0 PROFILE=0 \
+OUT="$ROOT/short" REPEATS=3 LEVELS=1,32 PER_USER=3 PRESETS="naive gateway" BURST=0 PROFILE=0 \
   bash "$HERE/run_benchmarks.sh"
 
 OUT="$ROOT/long" REPEATS=3 LEVELS=32 PER_USER=3 MAX_MODEL_LEN=4096 \

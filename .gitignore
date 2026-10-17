@@ -15,3 +15,6 @@ profile/
 *.pt
 results-run.log
 results-naive.log
+!results-final/
+!results-final/**
+!results-final/**/*.log

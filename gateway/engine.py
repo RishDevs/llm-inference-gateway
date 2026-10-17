@@ -34,6 +34,7 @@ class Sequence:
     outbox: object = None
     rid: int = field(default_factory=lambda: next(_ids))
     arrived: float = field(default_factory=time.monotonic)
+    admitted_at: float | None = None
     first_token_at: float | None = None
     finished_at: float | None = None
     output_ids: list[int] = field(default_factory=list)

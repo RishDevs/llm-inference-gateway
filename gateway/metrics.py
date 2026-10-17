@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from collections import deque
 
 import torch
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, generate_latest
@@ -25,6 +26,12 @@ class Metrics:
         )
         self.lane_events = Counter("gateway_lane_events", "Lane splits and merges", ["kind"], registry=r)
         self.preemptions = Counter("gateway_preemptions", "Sequences paused to free KV memory", registry=r)
+        self.queue_wait = Histogram(
+            "gateway_queue_wait_seconds", "Arrival to admission into a batch", buckets=LATENCY_BUCKETS, registry=r
+        )
+        self.prefill_latency = Histogram(
+            "gateway_prefill_seconds", "Admission to first token", buckets=LATENCY_BUCKETS, registry=r
+        )
         self.ooms = Counter("gateway_oom", "CUDA out-of-memory errors caught", registry=r)
         self.queue_depth = Gauge("gateway_queue_depth", "Requests waiting for a batch", registry=r)
         self.running = Gauge("gateway_running_rows", "Sequences being decoded", registry=r)
@@ -49,6 +56,7 @@ class Metrics:
             "lane_merges": 0,
             "rejected": 0,
         }
+        self.samples = {"ttft": deque(maxlen=20000), "queue": deque(maxlen=20000), "prefill": deque(maxlen=20000)}
         self.state = {"queue_depth": 0, "running_rows": 0, "lanes": 0, "budget_used": 0, "budget_capacity": -1}
 
     def set_state(self, queue_depth: int, running_rows: int, lanes: int, used: int, capacity: int | None) -> None:
@@ -94,6 +102,15 @@ class Metrics:
         self.requests.labels(outcome).inc()
         if seq.first_token_at is not None:
             self.ttft.observe(seq.first_token_at - seq.arrived)
+            if seq.admitted_at is not None:
+                queued = seq.admitted_at - seq.arrived
+                prefill = seq.first_token_at - seq.admitted_at
+                self.queue_wait.observe(queued)
+                self.prefill_latency.observe(prefill)
+                with self._lock:
+                    self.samples["ttft"].append(seq.first_token_at - seq.arrived)
+                    self.samples["queue"].append(queued)
+                    self.samples["prefill"].append(prefill)
         if seq.finished_at is not None and seq.output_ids:
             self.e2e.observe(seq.finished_at - seq.arrived)
         with self._lock:
@@ -120,10 +137,26 @@ class Metrics:
         with self._lock:
             self.totals["ooms"] += 1
 
+    def reset_samples(self) -> None:
+        with self._lock:
+            for q in self.samples.values():
+                q.clear()
+
+    def latency_breakdown(self) -> dict:
+        with self._lock:
+            pools = {k: sorted(v) for k, v in self.samples.items()}
+        out = {"samples": len(pools["ttft"])}
+        for name, vals in pools.items():
+            if vals:
+                out[f"{name}_p50_s"] = vals[len(vals) // 2]
+                out[f"{name}_p99_s"] = vals[min(len(vals) - 1, int(len(vals) * 0.99))]
+        return out
+
     def snapshot(self) -> dict:
         with self._lock:
             data = {k: (dict(v) if isinstance(v, dict) else v) for k, v in self.totals.items()}
             data.update(self.state)
+        data["server_latency"] = self.latency_breakdown()
         if torch.cuda.is_available():
             data["gpu_peak_bytes"] = torch.cuda.max_memory_allocated()
             data["gpu_total_bytes"] = torch.cuda.get_device_properties(0).total_memory

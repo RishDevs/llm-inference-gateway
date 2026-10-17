@@ -172,6 +172,13 @@ async def burst(url: str, model: str, jobs: list[Job], base: int, peak: int, pha
     return records
 
 
+def reset_server_samples(url: str) -> None:
+    try:
+        httpx.post(f"{url}/stats/reset", timeout=5.0)
+    except httpx.HTTPError:
+        pass
+
+
 def server_stats(url: str) -> dict | None:
     try:
         r = httpx.get(f"{url}/stats", timeout=5.0)
@@ -235,9 +242,13 @@ def main(argv=None) -> None:
         for level in args.concurrency:
             count = max(args.min_requests, level * args.requests_per_user)
             jobs = mixed_jobs(tok, count + level, args.seed + level, args.prompt_buckets, args.output_buckets)
+            reset_server_samples(args.url)
             recs = asyncio.run(closed_loop(args.url, args.model, jobs, level, warmup=level))
             summary = summarize(recs)
-            result["levels"].append({"concurrency": level, "summary": summary, "records": [asdict(r) for r in recs]})
+            server = (server_stats(args.url) or {}).get("server_latency")
+            result["levels"].append(
+                {"concurrency": level, "summary": summary, "server": server, "records": [asdict(r) for r in recs]}
+            )
             tput = summary.get("throughput_tok_s") or 0.0
             ttft = summary.get("ttft_p50_s") or 0.0
             e2e = summary.get("e2e_p99_s") or 0.0

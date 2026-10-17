@@ -99,3 +99,15 @@ def test_presets_and_cli():
     assert s.preset == "unbucketed" and not s.bucketing and s.max_batch_size == 8 and s.model == "m"
     env = from_env({"GATEWAY_PRESET": "unguarded", "GATEWAY_MAX_QUEUE": "9", "GATEWAY_BUCKETING": "false"})
     assert env.max_batch_size == 256 and env.max_queue == 9 and env.bucketing is False
+
+
+def test_latency_breakdown_and_reset(runner, tokenizer, settings):
+    client, _ = client_for(runner, tokenizer, settings)
+    with client:
+        client.post("/v1/completions", json={"prompt": "abc", "max_tokens": 3, "ignore_eos": True})
+        lat = client.get("/stats").json()["server_latency"]
+        assert lat["samples"] == 1
+        assert lat["queue_p50_s"] >= 0 and lat["prefill_p50_s"] >= 0
+        assert abs(lat["queue_p50_s"] + lat["prefill_p50_s"] - lat["ttft_p50_s"]) < 1e-6
+        assert client.post("/stats/reset").json()["status"] == "ok"
+        assert client.get("/stats").json()["server_latency"]["samples"] == 0

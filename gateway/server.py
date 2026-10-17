@@ -83,6 +83,11 @@ def create_app(settings: cfg.Settings, scheduler: Scheduler | None = None, token
         }
         return snap
 
+    @app.post("/stats/reset")
+    async def reset_stats():
+        state["scheduler"].metrics.reset_samples()
+        return {"status": "ok"}
+
     @app.post("/v1/completions")
     async def completions(body: CompletionRequest, request: Request):
         sched: Scheduler = state["scheduler"]
