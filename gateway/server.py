@@ -79,6 +79,7 @@ def create_app(settings: cfg.Settings, scheduler: Scheduler | None = None, token
             "max_prefill_tokens": settings.max_prefill_tokens,
             "bucketing": settings.bucketing,
             "admission": settings.admission,
+            "reserve": settings.reserve,
         }
         return snap
 
@@ -212,6 +213,8 @@ def parse_args(argv=None) -> cfg.Settings:
     p.add_argument("--join-wait-ms", type=float)
     p.add_argument("--max-prefill-tokens", type=int)
     p.add_argument("--token-budget", type=int)
+    p.add_argument("--reserve", choices=["grow", "worst"])
+    p.add_argument("--watermark", type=float)
     p.add_argument("--max-queue", type=int)
     p.add_argument("--queue-timeout-s", type=float)
     p.add_argument("--bucketing", action=argparse.BooleanOptionalAction, default=None)

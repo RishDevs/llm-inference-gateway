@@ -6,6 +6,7 @@ from dataclasses import dataclass, fields, replace
 PRESETS = {
     "gateway": {},
     "unbucketed": {"bucketing": False},
+    "worstcase": {"reserve": "worst"},
     "naive": {
         "max_batch_size": 1,
         "bucketing": False,
@@ -38,6 +39,8 @@ class Settings:
     max_prefill_tokens: int = 8192
     token_budget: int = 0
     kv_memory_fraction: float = 0.85
+    reserve: str = "grow"
+    watermark: float = 0.05
     max_queue: int = 48
     queue_timeout_s: float = 30.0
     retry_after_s: int = 1
@@ -52,6 +55,8 @@ class Settings:
     def validate(self) -> "Settings":
         if self.max_batch_size < 1:
             raise ValueError("max_batch_size must be >= 1")
+        if self.reserve not in ("grow", "worst"):
+            raise ValueError("reserve must be 'grow' or 'worst'")
         if self.admission and self.max_prefill_tokens < self.max_model_len:
             raise ValueError("max_prefill_tokens must be >= max_model_len")
         return self

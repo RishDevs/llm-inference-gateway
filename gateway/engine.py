@@ -40,10 +40,16 @@ class Sequence:
     finish_reason: str | None = None
     cancelled: bool = False
     reported: bool = False
+    admitted: int = 0
+    preemptions: int = 0
 
     @property
     def prompt_len(self) -> int:
         return len(self.prompt_ids)
+
+    @property
+    def context_len(self) -> int:
+        return len(self.prompt_ids) + len(self.output_ids)
 
     @property
     def need(self) -> int:
@@ -206,12 +212,12 @@ class ModelRunner:
     @torch.inference_mode()
     def prefill(self, seqs: list[Sequence]) -> tuple[Batch, list, StepStats]:
         rows = len(seqs)
-        width = max(s.prompt_len for s in seqs)
+        width = max(s.context_len for s in seqs)
         ids = torch.full((rows, width), self.pad_id, dtype=torch.long)
         mask = torch.zeros((rows, width), dtype=torch.long)
         for i, s in enumerate(seqs):
-            n = s.prompt_len
-            ids[i, width - n:] = torch.tensor(s.prompt_ids, dtype=torch.long)
+            n = s.context_len
+            ids[i, width - n:] = torch.tensor(s.prompt_ids + s.output_ids, dtype=torch.long)
             mask[i, width - n:] = 1
         pos = (mask.cumsum(-1) - 1).clamp_(min=0)
 
@@ -232,7 +238,7 @@ class ModelRunner:
             temps=torch.tensor([s.temperature for s in seqs], device=self.device, dtype=torch.float32),
             top_ps=torch.tensor([s.top_p for s in seqs], device=self.device, dtype=torch.float32),
         )
-        stats = StepStats(rows, width, rows * width, sum(s.prompt_len for s in seqs))
+        stats = StepStats(rows, width, rows * width, sum(s.context_len for s in seqs))
         picked = sample(out.logits[:, -1, :], batch.temps, batch.top_ps)
         return batch, self._advance(batch, picked), stats
 

@@ -131,17 +131,19 @@ def main(argv=None) -> None:
     )
     run(base, plain, jobs[: args.users], args.users, costs)
 
-    activities = [ProfilerActivity.CPU]
-    if loaded.device.type == "cuda":
-        activities.append(ProfilerActivity.CUDA)
-    prof = profile(activities=activities)
-    run(base, plain, jobs[: args.trace_requests], args.users, costs, profiler=prof)
+    table = ""
+    if args.trace_requests > 0:
+        activities = [ProfilerActivity.CPU]
+        if loaded.device.type == "cuda":
+            activities.append(ProfilerActivity.CUDA)
+        prof = profile(activities=activities)
+        run(base, plain, jobs[: args.trace_requests], args.users, costs, profiler=prof)
+        sort_key = "cuda_time_total" if loaded.device.type == "cuda" else "cpu_time_total"
+        table = prof.key_averages().table(sort_by=sort_key, row_limit=30)
+        (out / "fifo_top_ops.txt").write_text(table)
+        if not args.no_trace:
+            prof.export_chrome_trace(str(out / "fifo_trace.json"))
     fifo, _ = run(base, plain, jobs, args.users, costs)
-    sort_key = "cuda_time_total" if loaded.device.type == "cuda" else "cpu_time_total"
-    table = prof.key_averages().table(sort_by=sort_key, row_limit=30)
-    (out / "fifo_top_ops.txt").write_text(table)
-    if not args.no_trace:
-        prof.export_chrome_trace(str(out / "fifo_trace.json"))
 
     bucketed, _ = run(base, replace(plain, bucketing=True), jobs, args.users, costs)
 
@@ -169,7 +171,8 @@ def main(argv=None) -> None:
     }
     (out / "profile.json").write_text(json.dumps(report, indent=2))
 
-    print(table)
+    if table:
+        print(table)
     for name, r in (("FIFO", fifo), ("bucketed", bucketed)):
         print(
             f"{name:>9}: {r['throughput_tok_s']:7.1f} tok/s  padded tokens {r['padded_tokens']:>9}  "

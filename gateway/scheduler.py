@@ -35,6 +35,7 @@ class Scheduler:
         self.budget = TokenBudget(budget)
         self.costs = costs or StepCost(fixed_s=0.0, per_slot_s=1.0)
         self._lane_ids = itertools.count(1)
+        self._admit_ids = itertools.count(1)
         self._steps = 0
         self.waiting: list[Sequence] = []
         self.lanes: dict[int, Batch] = {}
@@ -127,7 +128,7 @@ class Scheduler:
             return
         now = time.monotonic()
         with self._lock:
-            stale = [q for q in self.waiting if now - q.arrived > limit]
+            stale = [q for q in self.waiting if not q.output_ids and now - q.arrived > limit]
             for q in stale:
                 self.waiting.remove(q)
         for q in stale:
@@ -137,9 +138,16 @@ class Scheduler:
     @staticmethod
     def join_padding(lane: Batch, seq: Sequence) -> int:
         width = lane.width
-        if seq.prompt_len <= width:
-            return width - seq.prompt_len
-        return (seq.prompt_len - width) * lane.size
+        if seq.context_len <= width:
+            return width - seq.context_len
+        return (seq.context_len - width) * lane.size
+
+    def footprint(self, lane: Batch | None) -> int:
+        if lane is None or lane.size == 0:
+            return 0
+        if self.settings.reserve == "worst":
+            return lane.size * lane.horizon
+        return lane.size * (lane.width + 1)
 
     def route(self, seq: Sequence) -> int:
         if not self.settings.bucketing or not self.lanes:
@@ -177,6 +185,8 @@ class Scheduler:
         fresh = next(self._lane_ids)
         self.lanes[key] = self.runner.take(lane, long)
         self.lanes[fresh] = self.runner.take(lane, short)
+        if self.settings.reserve == "grow":
+            held = max(held, self.footprint(self.lanes[key]) + self.footprint(self.lanes[fresh]))
         lane.cache = None
         self.reserved[key] = held
         self.reserved[fresh] = 0
@@ -186,7 +196,10 @@ class Scheduler:
 
     def _merge_lanes(self, a: int, b: int) -> None:
         first, second = self.lanes[a], self.lanes[b]
-        footprint = (first.size + second.size) * max(first.horizon, second.horizon)
+        if self.settings.reserve == "worst":
+            footprint = (first.size + second.size) * max(first.horizon, second.horizon)
+        else:
+            footprint = (first.size + second.size) * (max(first.width, second.width) + 1)
         held = self.reserved.get(a, 0) + self.reserved.get(b, 0)
         if footprint > held and not self.budget.take(footprint - held):
             return
@@ -225,28 +238,35 @@ class Scheduler:
             lane_rows = lane.size if lane is not None else 0
             held = self.reserved.get(key, 0)
 
+            worst = s.reserve == "worst"
+            lane_width = lane.width if lane is not None else 0
+            reserve_floor = 0 if worst or self.budget.unlimited else int(self.budget.capacity * s.watermark)
             picked: list[Sequence] = []
             width = 0
             horizon = lane.horizon if lane is not None else 0
             for q in pool:
                 if len(picked) >= free_rows:
                     break
-                w = max(width, q.prompt_len)
+                w = max(width, q.context_len)
                 h = max(horizon, q.need)
                 if s.admission and picked and (len(picked) + 1) * w > s.max_prefill_tokens:
                     continue
-                grown = (lane_rows + len(picked) + 1) * h
-                if not self.budget.fits(grown - held):
+                rows = lane_rows + len(picked) + 1
+                grown = rows * h if worst else rows * (max(lane_width, w) + 1)
+                if not self.budget.fits(grown - held + reserve_floor):
                     if not picked:
                         return key, []
                     continue
                 picked.append(q)
                 width, horizon = w, h
 
-            footprint = (lane_rows + len(picked)) * horizon
+            rows = lane_rows + len(picked)
+            footprint = rows * horizon if worst else rows * (max(lane_width, width) + 1)
             if not self.budget.take(footprint - held):
                 return key, []
             self.reserved[key] = footprint
+            for q in picked:
+                q.admitted = next(self._admit_ids)
             chosen = set(id(q) for q in picked)
             self.waiting = [q for q in self.waiting if id(q) not in chosen]
         return key, picked
@@ -269,8 +289,12 @@ class Scheduler:
         return True
 
     def _decode(self, key: int) -> None:
+        if key not in self.lanes:
+            return
         self.lanes[key].drop_cancelled()
         self._shrink(key)
+        if not self._grow(key):
+            return
         batch = self.lanes.get(key)
         if batch is None:
             return
@@ -285,6 +309,36 @@ class Scheduler:
         self.metrics.on_slots("decode", stats.slots, stats.useful)
         self._settle(emitted)
         self._shrink(key)
+
+    def _grow(self, key: int) -> bool:
+        if self.settings.reserve == "worst" or self.budget.unlimited:
+            return key in self.lanes
+        while key in self.lanes:
+            need = self.footprint(self.lanes[key]) - self.reserved.get(key, 0)
+            if need <= 0 or self.budget.take(need):
+                if need > 0:
+                    self.reserved[key] = self.reserved.get(key, 0) + need
+                return True
+            if not self._preempt():
+                return True
+        return False
+
+    def _preempt(self) -> bool:
+        victims = [(s.admitted, k, i) for k, b in self.lanes.items() for i, s in enumerate(b.seqs) if not s.finished]
+        if len(victims) <= 1:
+            return False
+        _, key, idx = max(victims)
+        lane = self.lanes[key]
+        seq = lane.seqs[idx]
+        keep = [i for i in range(lane.size) if i != idx]
+        self.lanes[key] = self.runner.take(lane, keep)
+        lane.cache = None
+        seq.preemptions += 1
+        with self._lock:
+            self.waiting.insert(0, seq)
+        self.metrics.on_preempt()
+        self._resize(key)
+        return True
 
     def _settle(self, emitted) -> None:
         self.runner.settle(emitted)
@@ -307,8 +361,7 @@ class Scheduler:
         self._resize(key)
 
     def _resize(self, key: int) -> None:
-        batch = self.lanes.get(key)
-        target = batch.size * batch.horizon if batch is not None else 0
+        target = self.footprint(self.lanes.get(key))
         held = self.reserved.get(key, 0)
         if target < held:
             self.budget.give_back(held - target)

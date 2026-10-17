@@ -24,6 +24,7 @@ class Metrics:
             "gateway_decode_batch_rows", "Rows per decode step", buckets=(1, 2, 4, 8, 16, 24, 32, 48, 64, 128), registry=r
         )
         self.lane_events = Counter("gateway_lane_events", "Lane splits and merges", ["kind"], registry=r)
+        self.preemptions = Counter("gateway_preemptions", "Sequences paused to free KV memory", registry=r)
         self.ooms = Counter("gateway_oom", "CUDA out-of-memory errors caught", registry=r)
         self.queue_depth = Gauge("gateway_queue_depth", "Requests waiting for a batch", registry=r)
         self.running = Gauge("gateway_running_rows", "Sequences being decoded", registry=r)
@@ -43,6 +44,7 @@ class Metrics:
             "decode_steps": 0,
             "decode_rows": 0,
             "ooms": 0,
+            "preemptions": 0,
             "lane_splits": 0,
             "lane_merges": 0,
             "rejected": 0,
@@ -107,6 +109,11 @@ class Metrics:
         self.lane_events.labels(kind).inc()
         with self._lock:
             self.totals[f"lane_{kind}s"] += 1
+
+    def on_preempt(self) -> None:
+        self.preemptions.inc()
+        with self._lock:
+            self.totals["preemptions"] += 1
 
     def on_oom(self) -> None:
         self.ooms.inc()

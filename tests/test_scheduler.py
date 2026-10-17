@@ -111,7 +111,7 @@ def test_unbucketed_takes_fifo(runner, settings):
 
 
 def test_budget_reserves_padded_footprint(runner, settings):
-    sched = Scheduler(runner, replace(settings, max_wait_ms=0.0, bucketing=False), budget=300)
+    sched = Scheduler(runner, replace(settings, max_wait_ms=0.0, bucketing=False, reserve="worst"), budget=300)
     a, b, c = seq(50, 50), seq(100, 40), seq(10, 10)
     for s in (a, b, c):
         sched.submit(s)
@@ -189,3 +189,49 @@ def test_queue_timeout(runner, settings):
     time.sleep(0.03)
     sched.step()
     assert s.finish_reason == "error"
+
+
+def test_grow_reserves_current_width_only(runner, settings):
+    sched = Scheduler(runner, replace(settings, max_wait_ms=0.0, bucketing=False), budget=10_000)
+    a, b = seq(50, 50), seq(100, 40)
+    sched.submit(a)
+    sched.submit(b)
+    sched._admit()
+    assert sched.reserved == {0: 2 * (100 + 1)}
+
+
+def test_preemption_under_memory_pressure_keeps_outputs_exact(runner, settings):
+    items = [seq(20, 40), seq(30, 40), seq(25, 40)]
+    solo = []
+    for s in items:
+        alone = Sequence(prompt_ids=list(s.prompt_ids), max_tokens=s.max_tokens, ignore_eos=True)
+        one = Scheduler(runner, replace(settings, max_wait_ms=0.0, bucketing=False), budget=None)
+        one.submit(alone)
+        drain(one, [alone])
+        solo.append(alone.output_ids)
+
+    sched = Scheduler(
+        runner, replace(settings, max_wait_ms=0.0, join_wait_ms=0.0, bucketing=False, watermark=0.0), budget=150
+    )
+    for s in items:
+        sched.submit(s)
+    for _ in range(10_000):
+        if all(s.finished for s in items):
+            break
+        sched.step()
+        assert sched.budget.used <= 150
+    assert all(s.finish_reason == "length" for s in items)
+    assert sched.metrics.totals["preemptions"] >= 1
+    assert sum(s.preemptions for s in items) >= 1
+    assert [s.output_ids for s in items] == solo
+    assert sched.budget.used == 0
+
+
+def test_preempted_request_is_not_expired(runner, settings):
+    sched = Scheduler(runner, replace(settings, queue_timeout_s=0.01, max_wait_ms=10_000), budget=None)
+    s = seq(5, 5)
+    s.output_ids = [7]
+    sched.waiting.append(s)
+    time.sleep(0.03)
+    sched._expire()
+    assert not s.finished

@@ -9,6 +9,8 @@ PER_USER="${PER_USER:-6}"
 PRESETS="${PRESETS:-naive unbucketed gateway}"
 BURST="${BURST:-1}"
 PROFILE="${PROFILE:-1}"
+REPEATS="${REPEATS:-1}"
+TRACE_REQUESTS="${TRACE_REQUESTS:-6}"
 BURST_PRESETS="${BURST_PRESETS:-gateway unguarded}"
 SERVER_ARGS=()
 if [[ -n "${MAX_MODEL_LEN:-}" ]]; then
@@ -56,10 +58,16 @@ trap 'kill ${SERVER_PID:-0} 2> /dev/null || true' EXIT
 for preset in $PRESETS; do
   echo "== steady sweep: $preset"
   serve "$preset"
-  python -m bench.load_test --url "$URL" --model "$MODEL" --label "$preset" \
-    --concurrency "$LEVELS" --requests-per-user "$PER_USER" \
-    --prompt-buckets "${PROMPTS:-64,128,256,512}" --output-buckets "${OUTPUTS:-32,64,128,256}" \
-    --out "$OUT/$preset.json"
+  for r in $(seq 1 "$REPEATS"); do
+    label="$preset"
+    if [[ "$REPEATS" -gt 1 ]]; then
+      label="$preset-r$r"
+    fi
+    python -m bench.load_test --url "$URL" --model "$MODEL" --label "$label" \
+      --concurrency "$LEVELS" --requests-per-user "$PER_USER" --seed "$r" \
+      --prompt-buckets "${PROMPTS:-64,128,256,512}" --output-buckets "${OUTPUTS:-32,64,128,256}" \
+      --out "$OUT/$label.json"
+  done
   halt
 done
 
@@ -77,7 +85,7 @@ fi
 
 if [[ "$PROFILE" == "1" ]]; then
   echo "== profiler"
-  python -m bench.profile_decode --model "$MODEL" "${DEVICE_ARGS[@]}" --trace-requests 6 \
+  python -m bench.profile_decode --model "$MODEL" "${DEVICE_ARGS[@]}" --trace-requests "$TRACE_REQUESTS" \
     --prompt-buckets "${PROMPTS:-64,128,256,512}" --output-buckets "${OUTPUTS:-32,64,128,256}" --out "$OUT/profile"
 fi
 
