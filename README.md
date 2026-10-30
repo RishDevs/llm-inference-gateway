@@ -1,3 +1,5 @@
+<img src=".github/header.svg" width="100%" alt="llm-inference-gateway — Inference Gateway — README header">
+
 # LLM Inference Gateway
 
 A serving layer that sits in front of Qwen2.5-1.5B and serves many users at once on a single free T4 GPU. It groups requests into micro-batches, streams tokens as they're generated, and limits how much work reaches the GPU so traffic bursts don't crash it.
